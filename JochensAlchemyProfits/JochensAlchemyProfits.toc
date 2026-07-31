@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: JochensAlchemyProfits
+## Notes: Alchemy recipe and auction-house profit calculator for Turtle WoW.
+## Author: ChatGPT & Jochen
+## Version: 0.10.0
+## SavedVariables: JochensAlchemyProfitsDB
+
+JochensAlchemyProfits.lua
