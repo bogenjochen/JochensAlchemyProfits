@@ -3,7 +3,7 @@
 -- No external libraries required.
 
 JAP = {}
-JAP.version = "0.10.0"
+JAP.version = "0.10.9"
 JAP.recipes = {}
 JAP.recipeByName = {}
 JAP.priceCache = {}
@@ -22,6 +22,11 @@ JAP.sortMode = "skill"
 JAP.favoritesOnly = false
 JAP.productsOnly = false
 JAP.displayRecipes = {}
+JAP.materials = {}
+JAP.currentPage = "recipes"
+JAP.materialFavoritesOnly = false
+JAP.selectedMaterial = nil
+JAP.selectedMaterials = {}
 
 local function chat(message)
     if DEFAULT_CHAT_FRAME then
@@ -232,6 +237,15 @@ local function db()
     if not JochensAlchemyProfitsDB.favorites then
         JochensAlchemyProfitsDB.favorites = {}
     end
+    if not JochensAlchemyProfitsDB.materialFavorites then
+        JochensAlchemyProfitsDB.materialFavorites = {}
+    end
+    if not JochensAlchemyProfitsDB.materialHistory then
+        JochensAlchemyProfitsDB.materialHistory = {}
+    end
+    if not JochensAlchemyProfitsDB.productHistory then
+        JochensAlchemyProfitsDB.productHistory = {}
+    end
     if not JochensAlchemyProfitsDB.manualSkills then
         JochensAlchemyProfitsDB.manualSkills = {}
     end
@@ -253,6 +267,9 @@ local function db()
     end
     if JochensAlchemyProfitsDB.settings.favoritesOnly == nil then
         JochensAlchemyProfitsDB.settings.favoritesOnly = false
+    end
+    if JochensAlchemyProfitsDB.settings.materialFavoritesOnly == nil then
+        JochensAlchemyProfitsDB.settings.materialFavoritesOnly = false
     end
     if JochensAlchemyProfitsDB.settings.productsOnly == nil then
         JochensAlchemyProfitsDB.settings.productsOnly = false
@@ -307,6 +324,127 @@ local function saveAuctionPrice(name, unitBuyout, itemId, auctions, scanMeta)
         rejectedRecipes = scanMeta and scanMeta.rejectedRecipes or 0,
         savedAt = time()
     }
+end
+
+
+local function updateMaterialHistory(name, currentPrice)
+    if not name or not currentPrice or currentPrice <= 0 then
+        return
+    end
+
+    local key = normalizeKey(name)
+    local historyDb = db().materialHistory
+    local history = historyDb[key]
+
+    if not history then
+        history = {
+            name = name,
+            referencePrice = currentPrice,
+            lastPrice = currentPrice,
+            lastIndex = 100,
+            samples = 1,
+            firstSeen = time(),
+            lastSeen = time()
+        }
+        historyDb[key] = history
+        return
+    end
+
+    local reference = history.referencePrice or currentPrice
+    if reference <= 0 then reference = currentPrice end
+
+    -- Display the current price relative to the historical reference.
+    history.lastIndex = (currentPrice / reference) * 100
+    history.lastPrice = currentPrice
+    history.samples = (history.samples or 0) + 1
+    history.lastSeen = time()
+
+    -- Adaptive reference:
+    -- move 10% toward each new observation so sustained price changes gradually
+    -- become the new normal, while short spikes still remain visible.
+    local alpha = 0.10
+    history.referencePrice = reference + ((currentPrice - reference) * alpha)
+end
+
+local function getMaterialHistory(name)
+    if not name then return nil end
+    return db().materialHistory[normalizeKey(name)]
+end
+
+local function materialIndexText(name)
+    local history = getMaterialHistory(name)
+    if not history or not history.lastIndex then
+        return "-"
+    end
+
+    local index = history.lastIndex
+    local text = string.format("%.0f%%", index)
+
+    if index < 97 then
+        return "|cff55ff55" .. text .. "|r"
+    elseif index > 103 then
+        return "|cffff5555" .. text .. "|r"
+    end
+
+    return "|cffffff66" .. text .. "|r"
+end
+
+local function updateProductHistory(name, currentPrice)
+    if not name or not currentPrice or currentPrice <= 0 then
+        return
+    end
+
+    local key = normalizeKey(name)
+    local historyDb = db().productHistory
+    local history = historyDb[key]
+
+    if not history then
+        history = {
+            name = name,
+            referencePrice = currentPrice,
+            lastPrice = currentPrice,
+            lastIndex = 100,
+            samples = 1,
+            firstSeen = time(),
+            lastSeen = time()
+        }
+        historyDb[key] = history
+        return
+    end
+
+    local reference = history.referencePrice or currentPrice
+    if reference <= 0 then reference = currentPrice end
+
+    history.lastIndex = (currentPrice / reference) * 100
+    history.lastPrice = currentPrice
+    history.samples = (history.samples or 0) + 1
+    history.lastSeen = time()
+
+    local alpha = 0.10
+    history.referencePrice = reference + ((currentPrice - reference) * alpha)
+end
+
+local function getProductHistory(name)
+    if not name then return nil end
+    return db().productHistory[normalizeKey(name)]
+end
+
+local function productIndexText(name)
+    local history = getProductHistory(name)
+    if not history or not history.lastIndex then
+        return nil
+    end
+
+    local index = history.lastIndex
+    local text = string.format("%.0f%%", index)
+
+    if index < 97 then
+        return "|cff55ff55" .. text .. "|r"
+    elseif index > 103 then
+        return "|cffff5555" .. text .. "|r"
+    end
+
+    return "|cffffff66" .. text .. "|r"
 end
 
 local function setStatus(text)
@@ -673,6 +811,64 @@ function JAP:SetProductsOnly(enabled)
     self:RefreshUI()
 end
 
+
+function JAP:BuildSelectedMaterialScan()
+    self:BuildMaterialsList()
+    local selected = self:GetSelectedMaterials()
+
+    if table.getn(selected) == 0 then
+        chat("Select one or more materials first.")
+        setStatus("Select one or more materials first.")
+        return
+    end
+
+    local items = {}
+    local materialIndex
+    for materialIndex = 1, table.getn(selected) do
+        local material = selected[materialIndex]
+        items[material.key] = {
+            name = material.name,
+            itemId = material.itemId,
+            itemKind = "reagent"
+        }
+    end
+
+    chat("Scanning " .. table.getn(selected) .. " selected material(s).")
+    self:StartScan(items, "materials-selected")
+end
+
+function JAP:BuildAllMaterialScan()
+    self:BuildMaterialsList()
+
+    if table.getn(self.materials) == 0 then
+        if self.materialFavoritesOnly then
+            chat("No favorite materials available to scan.")
+            setStatus("No favorite materials available to scan.")
+        else
+            chat("No materials available. Read your Alchemy recipes first.")
+            setStatus("No materials available. Read your Alchemy recipes first.")
+        end
+        return
+    end
+
+    local items = {}
+    local materialIndex
+    for materialIndex = 1, table.getn(self.materials) do
+        local material = self.materials[materialIndex]
+        items[material.key] = {
+            name = material.name,
+            itemId = material.itemId,
+            itemKind = "reagent"
+        }
+    end
+
+    local mode = self.materialFavoritesOnly
+        and "materials-favorites"
+        or "materials-all"
+
+    self:StartScan(items, mode)
+end
+
 function JAP:BuildSelectedScan()
     local selected = self:GetSelectedRecipes()
 
@@ -825,7 +1021,16 @@ function JAP:StartScan(items, mode)
 
     local scanScope = self.productsOnly and "crafted potion prices only" or "potions and ingredients"
 
-    if mode == "favorites" then
+    if mode == "materials-selected" then
+        chat("Starting fresh scan for " .. self.scanTotal .. " selected material(s).")
+        setStatus("Scanning selected materials...")
+    elseif mode == "materials-favorites" then
+        chat("Starting fresh scan for " .. self.scanTotal .. " favorite material(s).")
+        setStatus("Scanning favorite materials...")
+    elseif mode == "materials-all" then
+        chat("Starting fresh scan for all " .. self.scanTotal .. " material(s).")
+        setStatus("Scanning all materials...")
+    elseif mode == "favorites" then
         chat("Starting fresh favorites scan for " .. self.scanTotal ..
             " unique items (" .. scanScope .. ").")
         setStatus("Scanning favorite recipes: " .. scanScope .. "...")
@@ -984,6 +1189,12 @@ function JAP:ProcessAuctionPage()
             self.currentScan
         )
 
+        if self.currentScan.itemKind == "reagent" and self.currentScan.best ~= nil then
+            updateMaterialHistory(self.currentScan.name, self.currentScan.best)
+        elseif self.currentScan.itemKind == "product" and self.currentScan.best ~= nil then
+            updateProductHistory(self.currentScan.name, self.currentScan.best)
+        end
+
         local finishText = "Finished: " .. self.currentScan.name ..
             " - " .. self.currentScan.auctions .. " matching auction(s) on " ..
             self.currentScan.pages .. " page(s)"
@@ -1107,6 +1318,213 @@ end
 function JAP:RefreshUI()
     if not self.frame then return end
 
+    if self.currentPage == "materials" then
+        self:BuildMaterialsList()
+
+        if self.recipesTabButton then self.recipesTabButton:UnlockHighlight() end
+        if self.materialsTabButton then self.materialsTabButton:LockHighlight() end
+
+        local controls = self.recipeControls or {}
+        local controlIndex
+        for controlIndex = 1, table.getn(controls) do
+            controls[controlIndex]:Hide()
+        end
+
+        local materialControls = self.materialControls or {}
+        for controlIndex = 1, table.getn(materialControls) do
+            materialControls[controlIndex]:Show()
+        end
+
+        if self.materialFavoriteActionButton then
+            local selected = self:GetSelectedMaterials()
+            local allFavorite = table.getn(selected) > 0
+            local selectedIndex
+            for selectedIndex = 1, table.getn(selected) do
+                if not self:IsMaterialFavorite(selected[selectedIndex]) then
+                    allFavorite = false
+                    break
+                end
+            end
+
+            if allFavorite then
+                self.materialFavoriteActionButton:SetText("Remove Favorite")
+            else
+                self.materialFavoriteActionButton:SetText("Add Favorite")
+            end
+        end
+
+        if self.materialScanSelectedButton then
+            local selectedCount = table.getn(self:GetSelectedMaterials())
+            if selectedCount > 1 then
+                self.materialScanSelectedButton:SetText(
+                    "Scan Selected (" .. selectedCount .. ")"
+                )
+            else
+                self.materialScanSelectedButton:SetText("Scan Selected")
+            end
+        end
+
+        if self.materialScanAllButton then
+            if self.materialFavoritesOnly then
+                self.materialScanAllButton:SetText("Scan Favorites")
+            else
+                self.materialScanAllButton:SetText("Scan All")
+            end
+        end
+
+        if self.materialFavoritesViewButton then
+            local favoriteCount = 0
+            local favoriteKey, favoriteValue
+            for favoriteKey, favoriteValue in pairs(db().materialFavorites) do
+                if favoriteValue then favoriteCount = favoriteCount + 1 end
+            end
+
+            if self.materialFavoritesOnly then
+                self.materialFavoritesViewButton:SetText("Show All")
+            else
+                self.materialFavoritesViewButton:SetText("Favorites (" .. favoriteCount .. ")")
+            end
+        end
+
+        if self.columnHeaders then
+            self.columnHeaders[1]:SetText("Material")
+            self.columnHeaders[2]:SetText("Used by")
+            self.columnHeaders[3]:SetText("Lowest price")
+            self.columnHeaders[4]:SetText("History")
+        end
+
+        local materialCount = table.getn(self.materials)
+        local i
+        for i = 1, self.visibleRows do
+            local row = self.rows[i]
+            local material = self.materials[i + self.scrollOffset]
+
+            if material then
+                row.recipe = nil
+                row.material = material
+                row:Show()
+
+                if self:IsMaterialFavorite(material) then
+                    row.name:SetText("|cffffd100[F] |r" .. material.name)
+                else
+                    row.name:SetText(material.name)
+                end
+
+                row.cost:SetText(tostring(material.usedBy) .. " recipe(s)")
+
+                local materialPrice = getAnyStoredPrice(material.name)
+                row.market:SetText(moneyToText(materialPrice))
+                row.profit:SetText(materialIndexText(material.name))
+
+                if self:IsMaterialSelected(material) then
+                    row.highlight:Show()
+                else
+                    row.highlight:Hide()
+                end
+            else
+                row.recipe = nil
+                row.material = nil
+                row:Hide()
+            end
+        end
+
+        if self.scrollBar then
+            local maxOffset = math.max(0, materialCount - self.visibleRows)
+            if self.scrollOffset > maxOffset then self.scrollOffset = maxOffset end
+
+            self.updatingScrollBar = true
+            self.scrollBar:SetMinMaxValues(0, maxOffset)
+            self.scrollBar:SetValue(self.scrollOffset)
+            self.updatingScrollBar = false
+        end
+
+        if self.detailText then
+            local selected = self:GetSelectedMaterials()
+
+            if table.getn(selected) == 1 then
+                local material = selected[1]
+                local favoriteText = self:IsMaterialFavorite(material)
+                    and "Yes" or "No"
+
+                local recipeLines = {}
+                local recipeIndex
+                for recipeIndex = 1, table.getn(material.recipes or {}) do
+                    table.insert(recipeLines, "  - " .. material.recipes[recipeIndex])
+                end
+
+                local materialPrice = getAnyStoredPrice(material.name)
+                local priceText = moneyToText(materialPrice)
+                local priceEntry = db().prices[normalizeKey(material.name)]
+                local history = getMaterialHistory(material.name)
+
+                local historyText = "No historical data yet"
+                if history then
+                    historyText =
+                        string.format("%.0f%%", history.lastIndex or 100) ..
+                        " of adaptive reference\n" ..
+                        "Reference: " .. moneyToText(history.referencePrice) .. "\n" ..
+                        "Samples: " .. (history.samples or 1)
+                end
+
+                local scanText = ""
+                if priceEntry then
+                    scanText =
+                        "\nChecked: " .. (priceEntry.auctions or 0) ..
+                        " matching auction(s) on " ..
+                        (priceEntry.pages or 0) .. " page(s)"
+                end
+
+                self.detailText:SetText(
+                    "|cffffd100" .. material.name .. "|r\n\n" ..
+                    "Lowest unit price: " .. priceText .. scanText .. "\n" ..
+                    "Historical index: " .. historyText .. "\n" ..
+                    "Used by: " .. material.usedBy .. " recipe(s)\n" ..
+                    "Favorite: " .. favoriteText .. "\n\n" ..
+                    "|cffffd100Used in recipes:|r\n" ..
+                    table.concat(recipeLines, "\n")
+                )
+            elseif table.getn(selected) > 1 then
+                self.detailText:SetText(
+                    "|cffffd100" .. table.getn(selected) .. " materials selected|r\n\n" ..
+                    "Use Ctrl-click or Shift-click to add or remove materials."
+                )
+            else
+                self.detailText:SetText(
+                    "|cffffd100Materials|r\n\n" ..
+                    "No materials are available in this view."
+                )
+            end
+        end
+
+        if self.materialFavoritesOnly then
+            setStatus("Showing " .. materialCount .. " favorite materials.")
+        else
+            setStatus("Showing " .. materialCount .. " unique materials.")
+        end
+        return
+    end
+
+    if self.recipesTabButton then self.recipesTabButton:LockHighlight() end
+    if self.materialsTabButton then self.materialsTabButton:UnlockHighlight() end
+
+    local controls = self.recipeControls or {}
+    local controlIndex
+    for controlIndex = 1, table.getn(controls) do
+        controls[controlIndex]:Show()
+    end
+
+    local materialControls = self.materialControls or {}
+    for controlIndex = 1, table.getn(materialControls) do
+        materialControls[controlIndex]:Hide()
+    end
+
+    if self.columnHeaders then
+        self.columnHeaders[1]:SetText("Recipe")
+        self.columnHeaders[2]:SetText("Craft cost")
+        self.columnHeaders[3]:SetText("Lowest price")
+        self.columnHeaders[4]:SetText("Profit")
+    end
+
     self:BuildDisplayRecipes()
 
     if self.favoriteActionButton then
@@ -1173,7 +1591,13 @@ function JAP:RefreshUI()
             local result = recipe.result
             if result then
                 row.cost:SetText(moneyToText(result.craftingCost))
-                row.market:SetText(moneyToText(result.marketUnit))
+                local marketText = moneyToText(result.marketUnit)
+                local historyText = productIndexText(recipe.productName)
+                if historyText then
+                    marketText = marketText .. " (" .. historyText .. ")"
+                end
+                row.market:SetText(marketText)
+
                 if result.profit ~= nil then
                     if result.profit >= 0 then
                         row.profit:SetText("|cff55ff55+" .. moneyToText(result.profit) .. "|r")
@@ -1268,6 +1692,19 @@ function JAP:RefreshDetails()
         table.insert(lines, "Craft cost: " .. moneyToText(result.craftingCost))
         table.insert(lines, "Cheapest potion: " .. moneyToText(result.marketUnit) .. " each")
 
+        local productHistory = getProductHistory(recipe.productName)
+        if productHistory then
+            table.insert(lines,
+                "Historical price: " ..
+                string.format("%.0f%%", productHistory.lastIndex or 100) ..
+                " of adaptive reference")
+            table.insert(lines,
+                "Reference price: " ..
+                moneyToText(productHistory.referencePrice))
+            table.insert(lines,
+                "Price samples: " .. (productHistory.samples or 1))
+        end
+
         local productCache = db().prices[normalizeKey(recipe.productName)]
         if productCache then
             if productCache.bestStackSize and productCache.bestStackBuyout then
@@ -1311,10 +1748,194 @@ function JAP:CreateButton(parent, text, width, x, y, handler)
     return button
 end
 
+
+
+
+function JAP:IsMaterialSelected(material)
+    if not material then return false end
+    return self.selectedMaterials[material.key] == true
+end
+
+function JAP:GetSelectedMaterials()
+    local selected = {}
+    local materialIndex
+    for materialIndex = 1, table.getn(self.materials) do
+        local material = self.materials[materialIndex]
+        if self:IsMaterialSelected(material) then
+            table.insert(selected, material)
+        end
+    end
+    return selected
+end
+
+function JAP:SelectMaterial(material, additive)
+    if not material then return end
+
+    if not additive then
+        self.selectedMaterials = {}
+        self.selectedMaterials[material.key] = true
+    else
+        if self.selectedMaterials[material.key] then
+            self.selectedMaterials[material.key] = nil
+        else
+            self.selectedMaterials[material.key] = true
+        end
+    end
+
+    local selected = self:GetSelectedMaterials()
+    self.selectedMaterial = selected[1]
+    self:RefreshUI()
+end
+
+function JAP:IsMaterialFavorite(material)
+    if not material then return false end
+    return db().materialFavorites[material.key] == true
+end
+
+function JAP:ToggleMaterialFavorite(material)
+    local selected = self:GetSelectedMaterials()
+    if table.getn(selected) == 0 and material then
+        table.insert(selected, material)
+    end
+
+    if table.getn(selected) == 0 then
+        chat("Select one or more materials first.")
+        return
+    end
+
+    local shouldFavorite = false
+    local selectedIndex
+    for selectedIndex = 1, table.getn(selected) do
+        if not self:IsMaterialFavorite(selected[selectedIndex]) then
+            shouldFavorite = true
+            break
+        end
+    end
+
+    local database = db()
+    for selectedIndex = 1, table.getn(selected) do
+        local selectedMaterial = selected[selectedIndex]
+        if shouldFavorite then
+            database.materialFavorites[selectedMaterial.key] = true
+        else
+            database.materialFavorites[selectedMaterial.key] = nil
+        end
+    end
+
+    if shouldFavorite then
+        chat(table.getn(selected) .. " material(s) added to favorites and saved.")
+    else
+        chat(table.getn(selected) .. " material(s) removed from favorites and saved.")
+    end
+
+    if self.materialFavoritesOnly then
+        self.selectedMaterials = {}
+        self.selectedMaterial = nil
+    end
+
+    self:RefreshUI()
+end
+
+function JAP:SetMaterialFavoritesOnly(enabled)
+    self.materialFavoritesOnly = enabled and true or false
+    db().settings.materialFavoritesOnly = self.materialFavoritesOnly
+    self.scrollOffset = 0
+    self.selectedMaterial = nil
+    self.selectedMaterials = {}
+    self:RefreshUI()
+end
+
+function JAP:BuildMaterialsList()
+    clearArray(self.materials)
+
+    local unique = {}
+    local recipeIndex
+    for recipeIndex = 1, table.getn(self.recipes) do
+        local recipe = self.recipes[recipeIndex]
+
+        if recipe and recipe.reagents then
+            local reagentIndex
+            for reagentIndex = 1, table.getn(recipe.reagents) do
+                local reagent = recipe.reagents[reagentIndex]
+
+                if reagent and reagent.name and not isExcludedVial(reagent.name) then
+                    local key = reagent.key or normalizeKey(reagent.name)
+
+                    if not unique[key] then
+                        unique[key] = {
+                            name = reagent.name,
+                            key = key,
+                            itemId = reagent.itemId,
+                            link = reagent.link,
+                            usedBy = 0,
+                            recipes = {}
+                        }
+                    end
+
+                    unique[key].usedBy = unique[key].usedBy + 1
+                    table.insert(unique[key].recipes, recipe.name)
+                end
+            end
+        end
+    end
+
+    local key, material
+    for key, material in pairs(unique) do
+        if not self.materialFavoritesOnly or self:IsMaterialFavorite(material) then
+            table.insert(self.materials, material)
+        end
+    end
+
+    table.sort(self.materials, function(a, b)
+        return lower(a.name) < lower(b.name)
+    end)
+
+    local visibleSelection = {}
+    local materialIndex
+    for materialIndex = 1, table.getn(self.materials) do
+        local material = self.materials[materialIndex]
+        if self.selectedMaterials[material.key] then
+            visibleSelection[material.key] = true
+        end
+    end
+    self.selectedMaterials = visibleSelection
+
+    local selected = self:GetSelectedMaterials()
+    self.selectedMaterial = selected[1]
+
+    if not self.selectedMaterial and table.getn(self.materials) > 0 then
+        self.selectedMaterial = self.materials[1]
+        self.selectedMaterials[self.selectedMaterial.key] = true
+    end
+end
+
+function JAP:SetPage(page)
+    if page ~= "recipes" and page ~= "materials" then return end
+    self.currentPage = page
+    self.scrollOffset = 0
+    self:RefreshUI()
+end
+
+
+function JAP:HandleMouseWheel(delta)
+    if not self.scrollBar or not delta then return end
+
+    local minValue, maxValue = self.scrollBar:GetMinMaxValues()
+    local currentValue = self.scrollBar:GetValue() or 0
+    local newValue = currentValue - (delta * 3)
+
+    if newValue < minValue then newValue = minValue end
+    if newValue > maxValue then newValue = maxValue end
+
+    self.scrollBar:SetValue(newValue)
+end
+
 function JAP:CreateUI()
     self.sortMode = db().settings.sortMode or "alphabetical"
     self.favoritesOnly = db().settings.favoritesOnly == true
     self.productsOnly = db().settings.productsOnly == true
+    self.currentPage = "recipes"
+    self.materialFavoritesOnly = db().settings.materialFavoritesOnly == true
     local frame = CreateFrame("Frame", "JochensAlchemyProfitsFrame", UIParent)
     self.frame = frame
     frame:SetWidth(760)
@@ -1332,6 +1953,10 @@ function JAP:CreateUI()
     })
     frame:SetMovable(true)
     frame:EnableMouse(true)
+    frame:EnableMouseWheel(1)
+    frame:SetScript("OnMouseWheel", function()
+        JAP:HandleMouseWheel(arg1)
+    end)
     frame:RegisterForDrag("LeftButton")
     frame:SetScript("OnShow", function()
         this:SetFrameStrata("DIALOG")
@@ -1344,6 +1969,19 @@ function JAP:CreateUI()
     frame:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
     frame:Hide()
 
+    -- Allow the standard Escape key to close the addon window.
+    local specialFrameExists = false
+    local specialIndex
+    for specialIndex = 1, table.getn(UISpecialFrames) do
+        if UISpecialFrames[specialIndex] == "JochensAlchemyProfitsFrame" then
+            specialFrameExists = true
+            break
+        end
+    end
+    if not specialFrameExists then
+        table.insert(UISpecialFrames, "JochensAlchemyProfitsFrame")
+    end
+
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", frame, "TOP", 0, -18)
     title:SetText("JochensAlchemyProfits")
@@ -1351,32 +1989,126 @@ function JAP:CreateUI()
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -5, -5)
 
+    local recipesTabButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    self.recipesTabButton = recipesTabButton
+    recipesTabButton:SetWidth(100)
+    recipesTabButton:SetHeight(22)
+    recipesTabButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -42)
+    recipesTabButton:SetText("Recipes")
+    recipesTabButton:SetScript("OnClick", function() JAP:SetPage("recipes") end)
+
+    local materialsTabButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    self.materialsTabButton = materialsTabButton
+    materialsTabButton:SetWidth(100)
+    materialsTabButton:SetHeight(22)
+    materialsTabButton:SetPoint("LEFT", recipesTabButton, "RIGHT", 8, 0)
+    materialsTabButton:SetText("Materials")
+    materialsTabButton:SetScript("OnClick", function() JAP:SetPage("materials") end)
+
+    self.recipeControls = {}
+    self.materialControls = {}
+
+    local materialScanSelectedButton = self:CreateButton(
+        frame,
+        "Scan Selected",
+        140,
+        20,
+        -76,
+        function()
+            JAP:BuildSelectedMaterialScan()
+        end
+    )
+    self.materialScanSelectedButton = materialScanSelectedButton
+    table.insert(self.materialControls, materialScanSelectedButton)
+    materialScanSelectedButton:Hide()
+
+    local materialScanAllButton = self:CreateButton(
+        frame,
+        "Scan All",
+        130,
+        175,
+        -76,
+        function()
+            JAP:BuildAllMaterialScan()
+        end
+    )
+    self.materialScanAllButton = materialScanAllButton
+    table.insert(self.materialControls, materialScanAllButton)
+    materialScanAllButton:Hide()
+
+    local materialCancelButton = self:CreateButton(
+        frame,
+        "Cancel",
+        90,
+        320,
+        -76,
+        function()
+            JAP:CancelScan("Scan cancelled.")
+        end
+    )
+    table.insert(self.materialControls, materialCancelButton)
+    materialCancelButton:Hide()
+
+    local materialFavoriteActionButton = self:CreateButton(
+        frame,
+        "Add Favorite",
+        130,
+        20,
+        -110,
+        function()
+            JAP:ToggleMaterialFavorite(JAP.selectedMaterial)
+        end
+    )
+    self.materialFavoriteActionButton = materialFavoriteActionButton
+    table.insert(self.materialControls, materialFavoriteActionButton)
+    materialFavoriteActionButton:Hide()
+
+    local materialFavoritesViewButton = self:CreateButton(
+        frame,
+        "Show Favorites",
+        130,
+        165,
+        -110,
+        function()
+            JAP:SetMaterialFavoritesOnly(not JAP.materialFavoritesOnly)
+        end
+    )
+    self.materialFavoritesViewButton = materialFavoritesViewButton
+    table.insert(self.materialControls, materialFavoritesViewButton)
+    materialFavoritesViewButton:Hide()
+
     -- Main action row.
-    self:CreateButton(frame, "Read Alchemy", 120, 20, -48, function() JAP:ReadAlchemy() end)
-    local scanSelectedButton = self:CreateButton(frame, "Scan Selected", 140, 155, -48, function()
+    local readAlchemyButton = self:CreateButton(frame, "Read Alchemy", 120, 20, -76, function() JAP:ReadAlchemy() end)
+    table.insert(self.recipeControls, readAlchemyButton)
+    local scanSelectedButton = self:CreateButton(frame, "Scan Selected", 140, 155, -76, function()
         JAP:BuildSelectedScan()
     end)
     self.scanSelectedButton = scanSelectedButton
+    table.insert(self.recipeControls, scanSelectedButton)
 
-    local scanAllButton = self:CreateButton(frame, "Scan All", 130, 300, -48, function()
+    local scanAllButton = self:CreateButton(frame, "Scan All", 130, 300, -76, function()
         JAP:BuildAllScan()
     end)
     self.scanAllButton = scanAllButton
+    table.insert(self.recipeControls, scanAllButton)
 
-    self:CreateButton(frame, "Cancel", 90, 445, -48, function()
+    local cancelButton = self:CreateButton(frame, "Cancel", 90, 445, -76, function()
         JAP:CancelScan("Scan cancelled.")
     end)
+    table.insert(self.recipeControls, cancelButton)
 
     -- Secondary row: favorites on the left, sorting and maintenance on the right.
-    local favoriteActionButton = self:CreateButton(frame, "Add Favorite", 130, 20, -82, function()
+    local favoriteActionButton = self:CreateButton(frame, "Add Favorite", 130, 20, -110, function()
         JAP:ToggleFavorite(JAP.selectedRecipe)
     end)
     self.favoriteActionButton = favoriteActionButton
+    table.insert(self.recipeControls, favoriteActionButton)
 
-    local favoritesViewButton = self:CreateButton(frame, "Show Favorites", 130, 165, -82, function()
+    local favoritesViewButton = self:CreateButton(frame, "Show Favorites", 130, 165, -110, function()
         JAP:SetFavoritesOnly(not JAP.favoritesOnly)
     end)
     self.favoritesViewButton = favoritesViewButton
+    table.insert(self.recipeControls, favoritesViewButton)
 
     local productsOnlyCheck = CreateFrame(
         "CheckButton",
@@ -1385,9 +2117,10 @@ function JAP:CreateUI()
         "UICheckButtonTemplate"
     )
     self.productsOnlyCheck = productsOnlyCheck
+    table.insert(self.recipeControls, productsOnlyCheck)
     productsOnlyCheck:SetWidth(24)
     productsOnlyCheck:SetHeight(24)
-    productsOnlyCheck:SetPoint("TOPLEFT", frame, "TOPLEFT", 305, -80)
+    productsOnlyCheck:SetPoint("TOPLEFT", frame, "TOPLEFT", 305, -108)
     productsOnlyCheck:SetChecked(self.productsOnly)
     productsOnlyCheck:SetScript("OnClick", function()
         JAP:SetProductsOnly(this:GetChecked() == 1)
@@ -1396,20 +2129,24 @@ function JAP:CreateUI()
     local productsOnlyLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     productsOnlyLabel:SetPoint("LEFT", productsOnlyCheck, "RIGHT", 2, 0)
     productsOnlyLabel:SetText("Potion prices only")
+    table.insert(self.recipeControls, productsOnlyLabel)
 
     local sortLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    sortLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 485, -88)
+    sortLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 485, -116)
     sortLabel:SetText("Sort by")
+    table.insert(self.recipeControls, sortLabel)
 
     local sortDropDown = CreateFrame("Frame", "JAPSortDropDown", frame, "UIDropDownMenuTemplate")
     self.sortDropDown = sortDropDown
-    sortDropDown:SetPoint("TOPLEFT", frame, "TOPLEFT", 530, -74)
+    table.insert(self.recipeControls, sortDropDown)
+    sortDropDown:SetPoint("TOPLEFT", frame, "TOPLEFT", 530, -102)
     UIDropDownMenu_SetWidth(110, sortDropDown)
 
-    local clearRecipesButton = self:CreateButton(frame, "Clear Recipes", 100, 630, -48, function()
+    local clearRecipesButton = self:CreateButton(frame, "Clear Recipes", 100, 630, -76, function()
         JAP:ClearSavedRecipes()
     end)
     self.clearRecipesButton = clearRecipesButton
+    table.insert(self.recipeControls, clearRecipesButton)
 
     UIDropDownMenu_Initialize(sortDropDown, function()
         local info = {}
@@ -1434,26 +2171,43 @@ function JAP:CreateUI()
 
     local status = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     self.statusText = status
-    status:SetPoint("TOPLEFT", frame, "TOPLEFT", 22, -118)
+    status:SetPoint("TOPLEFT", frame, "TOPLEFT", 22, -145)
     status:SetWidth(710)
     status:SetJustifyH("LEFT")
     status:SetText("Open Alchemy, read recipes, then open the Auction House.")
 
     local headers = {"Recipe", "Craft cost", "Lowest price", "Profit"}
     local positions = {24, 245, 345, 445}
+    self.columnHeaders = {}
     local h
     for h = 1, 4 do
         local header = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        header:SetPoint("TOPLEFT", frame, "TOPLEFT", positions[h], -144)
+        header:SetPoint("TOPLEFT", frame, "TOPLEFT", positions[h], -171)
         header:SetText(headers[h])
+        self.columnHeaders[h] = header
     end
+
+    local listWheelCatcher = CreateFrame("Frame", nil, frame)
+    self.listWheelCatcher = listWheelCatcher
+    listWheelCatcher:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -184)
+    listWheelCatcher:SetPoint("BOTTOMRIGHT", frame, "BOTTOMLEFT", 525, 55)
+    listWheelCatcher:SetFrameLevel(frame:GetFrameLevel() + 1)
+    listWheelCatcher:EnableMouse(false)
+    listWheelCatcher:EnableMouseWheel(1)
+    listWheelCatcher:SetScript("OnMouseWheel", function()
+        JAP:HandleMouseWheel(arg1)
+    end)
 
     local rowIndex
     for rowIndex = 1, self.visibleRows do
         local row = CreateFrame("Button", nil, frame)
         row:SetWidth(505)
         row:SetHeight(25)
-        row:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -161 - ((rowIndex - 1) * 27))
+        row:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -188 - ((rowIndex - 1) * 27))
+        row:EnableMouseWheel(1)
+        row:SetScript("OnMouseWheel", function()
+            JAP:HandleMouseWheel(arg1)
+        end)
 
         row.highlight = row:CreateTexture(nil, "BACKGROUND")
         row.highlight:SetAllPoints(row)
@@ -1482,21 +2236,32 @@ function JAP:CreateUI()
         row.profit:SetJustifyH("LEFT")
 
         row:SetScript("OnClick", function()
-            if this.recipe then
+            if JAP.currentPage == "recipes" and this.recipe then
                 local additive = false
                 if IsControlKeyDown and IsControlKeyDown() then additive = true end
                 if IsShiftKeyDown and IsShiftKeyDown() then additive = true end
                 JAP:SelectRecipe(this.recipe, additive)
+            elseif JAP.currentPage == "materials" and this.material then
+                local additive = false
+                if IsControlKeyDown and IsControlKeyDown() then additive = true end
+                if IsShiftKeyDown and IsShiftKeyDown() then additive = true end
+                JAP:SelectMaterial(this.material, additive)
             end
         end)
         row:SetScript("OnEnter", function()
-            if this.recipe then
+            if this.recipe or this.material then
                 this.highlight:Show()
             end
         end)
         row:SetScript("OnLeave", function()
-            if not JAP:IsRecipeSelected(this.recipe) then
-                this.highlight:Hide()
+            if JAP.currentPage == "recipes" then
+                if not JAP:IsRecipeSelected(this.recipe) then
+                    this.highlight:Hide()
+                end
+            elseif JAP.currentPage == "materials" then
+                if not JAP:IsMaterialSelected(this.material) then
+                    this.highlight:Hide()
+                end
             end
         end)
 
@@ -1505,7 +2270,7 @@ function JAP:CreateUI()
 
     local scroll = CreateFrame("Slider", nil, frame, "UIPanelScrollBarTemplate")
     self.scrollBar = scroll
-    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 526, -164)
+    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 526, -191)
     scroll:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 526, 55)
 
     -- Replace the template handler before SetValue is called.
@@ -1524,11 +2289,15 @@ function JAP:CreateUI()
     scroll:SetMinMaxValues(0, 0)
     scroll:SetValueStep(1)
     scroll:SetValue(0)
+    scroll:EnableMouseWheel(1)
+    scroll:SetScript("OnMouseWheel", function()
+        JAP:HandleMouseWheel(arg1)
+    end)
 
     local detailBox = CreateFrame("Frame", nil, frame)
     detailBox:SetWidth(200)
     detailBox:SetHeight(350)
-    detailBox:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -22, -148)
+    detailBox:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -22, -175)
     detailBox:SetBackdrop({
         bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -1538,6 +2307,11 @@ function JAP:CreateUI()
         insets = {left = 4, right = 4, top = 4, bottom = 4}
     })
     detailBox:SetBackdropColor(0, 0, 0, 0.75)
+    detailBox:EnableMouse(true)
+    detailBox:EnableMouseWheel(1)
+    detailBox:SetScript("OnMouseWheel", function()
+        JAP:HandleMouseWheel(arg1)
+    end)
 
     local detail = detailBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     self.detailText = detail
@@ -1651,6 +2425,38 @@ function JAP:HandleSlash(message)
         return
     end
 
+    if lower(message) == "scanmaterials" then
+        self:BuildSelectedMaterialScan()
+        return
+    end
+
+    if lower(message) == "scanallmaterials" then
+        self:BuildAllMaterialScan()
+        return
+    end
+
+    if lower(message) == "resethistory" then
+        db().materialHistory = {}
+        db().productHistory = {}
+        chat("Material and potion price history cleared.")
+        self:RefreshUI()
+        return
+    end
+
+    if lower(message) == "resetmaterialhistory" then
+        db().materialHistory = {}
+        chat("Material price history cleared.")
+        self:RefreshUI()
+        return
+    end
+
+    if lower(message) == "resetpotionhistory" then
+        db().productHistory = {}
+        chat("Potion price history cleared.")
+        self:RefreshUI()
+        return
+    end
+
     if lower(message) == "debugitem" then
         if self.selectedRecipe then
             chat("Recipe: " .. tostring(self.selectedRecipe.name))
@@ -1676,6 +2482,8 @@ function JAP:HandleSlash(message)
     chat("/jap setprice Item Name = 1g 20s")
     chat("/jap clearprice Item Name, /jap cut 5")
     chat("/jap favorites, /jap productsonly")
+    chat("/jap scanmaterials, /jap scanallmaterials")
+    chat("/jap resethistory, /jap resetmaterialhistory, /jap resetpotionhistory")
     chat("/jap setskill Recipe Name = 275, /jap clearskill Recipe Name")
     chat("/jap debugitem shows the exact crafted item used for the selected recipe.")
 end
