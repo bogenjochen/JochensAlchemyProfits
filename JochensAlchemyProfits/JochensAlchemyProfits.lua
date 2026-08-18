@@ -3,7 +3,7 @@
 -- No external libraries required.
 
 JAP = {}
-JAP.version = "0.20.19"
+JAP.version = "0.20.20"
 JAP.recipes = {}
 JAP.recipeByName = {}
 JAP.priceCache = {}
@@ -2386,22 +2386,34 @@ function JAP:StartAuctionWatch()
         return
     end
 
+    -- A manual Check My Auctions is always a completely fresh run.
+    -- Throw away every visible/result row first so stale data can never make
+    -- the second check look like nothing happened.
     self:ClearAuctionWatch()
+    self.scrollOffset = 0
     self.auctionWatchOwnerRefreshOnly = false
     self.auctionWatchPreservedResults = nil
-    self.auctionWatchOwnerRefreshProcessAt = 0
     self.auctionWatchOwnerRefreshStage = 0
     self.auctionWatchOwnerScanRunning = true
     self.auctionWatchOwnerPage = 0
     self.auctionWatchLastCheck = nil
+
+    -- Clear the visible table immediately.
+    self:RefreshUI()
 
     setStatus("Reading your current Auction House listings...")
     chat("Checking your current Alchemy auctions...")
 
     if GetOwnerAuctionItems then
         self:RequestOwnerAuctionList()
+
+        -- Turtle/Octo may not emit AUCTION_OWNED_LIST_UPDATE again when the
+        -- owner list was already loaded. Always process it after a short delay
+        -- as a fallback. If the real event arrives first it cancels this timer.
+        self.auctionWatchOwnerRefreshProcessAt = now() + 0.30
     else
         self.auctionWatchOwnerScanRunning = false
+        self.auctionWatchOwnerRefreshProcessAt = 0
         chat("This client does not expose the owner auction list.")
     end
 end
@@ -9347,6 +9359,7 @@ eventFrame:SetScript("OnEvent", function()
             end
         elseif JAP.auctionWatchOwnerScanRunning then
             if not JAP.auctionWatchOwnerRefreshOnly then
+                -- Real event arrived before the timer fallback.
                 JAP.auctionWatchOwnerRefreshProcessAt = 0
                 JAP.auctionWatchOwnerRefreshStage = 0
                 JAP:ProcessAuctionWatchOwnerPage()
