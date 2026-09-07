@@ -3,7 +3,7 @@
 -- No external libraries required.
 
 JAP = {}
-JAP.version = "0.20.20"
+JAP.version = "0.20.48"
 JAP.recipes = {}
 JAP.recipeByName = {}
 JAP.priceCache = {}
@@ -14,6 +14,12 @@ JAP.selectedRecipe = nil
 JAP.selectedRecipes = {}
 JAP.lastQueryAt = 0
 JAP.queryDelay = 0.05
+JAP.fastQueryDelay = 0.01
+JAP.lastAuctionResponseAt = 0
+JAP.scanQueryInFlight = false
+JAP.scanQuerySentAt = 0
+JAP.fastAuctionResponses = 0
+JAP.normalAuctionResponses = 0
 JAP.lastLiveRecalculateAt = 0
 JAP.liveRecalculateMinInterval = 0.05
 JAP.completionSounds = true
@@ -123,6 +129,26 @@ JAP.auctionWatchOwnerRefreshOnly = false
 JAP.auctionWatchPreservedResults = nil
 JAP.auctionWatchOwnerRefreshProcessAt = 0
 JAP.auctionWatchOwnerRefreshStage = 0
+JAP.flaskTopUpTarget = 3
+JAP.flaskTopUpPrepareAt = 0
+JAP.flaskTopUpScanPending = false
+JAP.flaskTopUpRunning = false
+JAP.flaskTopUpBagFlasks = {}
+JAP.flaskTopUpOwner = {}
+JAP.flaskTopUpLiveListings = {}
+JAP.flaskTopUpPosted = 0
+JAP.flaskTopUpRecheckAt = 0
+JAP.autoFlasksRunning = false
+JAP.autoFlasksPhase = nil
+JAP.autoFlasksInitialOwner = {}
+JAP.autoFlasksTargetKeys = {}
+JAP.autoFlasksCancelledItems = 0
+JAP.autoFlasksCancelledAuctions = 0
+JAP.autoFlasksPosted = 0
+JAP.flaskTopUpFilterKeys = nil
+JAP.flaskAutomationFilterSlots = {}
+JAP.flaskShortageAlarmRemaining = 0
+JAP.flaskShortageAlarmNextAt = 0
 
 local MISSING_RECIPE_CATALOG = {
     "Recipe: Alchemist's Stone",
@@ -663,6 +689,12 @@ local function db()
     if JochensAlchemyProfitsDB.settings.completionSounds == nil then
         JochensAlchemyProfitsDB.settings.completionSounds = true
     end
+    if JochensAlchemyProfitsDB.settings.flaskTopUpTarget == nil then
+        JochensAlchemyProfitsDB.settings.flaskTopUpTarget = 3
+    end
+    if not JochensAlchemyProfitsDB.settings.flaskAutomationEnabled then
+        JochensAlchemyProfitsDB.settings.flaskAutomationEnabled = {}
+    end
     if not JochensAlchemyProfitsDB.favorites then
         JochensAlchemyProfitsDB.favorites = {}
     end
@@ -1086,6 +1118,154 @@ local function getProductHistory(name)
     end
 
     return history
+end
+
+local FLASK_PRICE_FAILSAFE_COPPER = 10000
+local FLASK_PRICE_FAILSAFE_SAMPLES = 15
+local FLASK_PRICE_FAILSAFE_MARKET_SELLERS = 4
+local FLASK_PRICE_FAILSAFE_CLUSTER_LISTINGS = 6
+local FLASK_PRICE_FAILSAFE_CLUSTER_SELLERS = 2
+local FLASK_PRICE_FAILSAFE_CLUSTER_RANGE = 5000
+
+local function getFlaskFailsafeReference(name)
+    if not name then return nil, 0 end
+
+    local history = db().productHistory[normalizeKey(name)]
+    if not history then return nil, 0 end
+
+    pruneHistorySamples(history, time())
+    migrateHistorySamples(history)
+
+    local samples = history.samplesList or {}
+    local sampleCount = table.getn(samples)
+    if sampleCount == 0 then return nil, 0 end
+
+    -- The scan that triggered this Top Up may already have appended its
+    -- current cheapest value to productHistory. Exclude the newest sample so
+    -- an extreme dump price cannot lower its own safety reference.
+    local lastIndex = sampleCount - 1
+
+    -- If there is only one stored sample, there is no trustworthy prior
+    -- reference yet.
+    if lastIndex < 1 then
+        return nil, 0
+    end
+
+    local firstIndex =
+        math.max(1, lastIndex - FLASK_PRICE_FAILSAFE_SAMPLES + 1)
+
+    local total = 0
+    local count = 0
+    local i
+
+    for i = firstIndex, lastIndex do
+        local sample = samples[i]
+        if sample and sample.price and sample.price > 0 then
+            total = total + sample.price
+            count = count + 1
+        end
+    end
+
+    if count == 0 then return nil, 0 end
+
+    return total / count, count
+end
+
+function JAP:CountFlaskFailsafeMarketSellers(
+    listings,
+    referencePrice,
+    playerName
+)
+    if not listings or not referencePrice then return 0 end
+
+    local cutoff =
+        referencePrice - FLASK_PRICE_FAILSAFE_COPPER
+    local sellers = {}
+    local sellerCount = 0
+    local i
+
+    for i = 1, table.getn(listings) do
+        local listing = listings[i]
+
+        if listing and listing.unitPrice
+           and listing.unitPrice <= cutoff
+           and listing.owner
+           and listing.owner ~= "" then
+            local ownerKey = lower(listing.owner)
+            local isMine =
+                playerName
+                and ownerKey == lower(playerName)
+
+            if not isMine and not sellers[ownerKey] then
+                sellers[ownerKey] = true
+                sellerCount = sellerCount + 1
+            end
+        end
+    end
+
+    return sellerCount
+end
+
+function JAP:CountFlaskFailsafeMarketCluster(
+    listings,
+    marketFloor,
+    playerName
+)
+    if not listings or not marketFloor then return 0, 0 end
+
+    local maxClusterPrice =
+        marketFloor + FLASK_PRICE_FAILSAFE_CLUSTER_RANGE
+    local listingCount = 0
+    local sellers = {}
+    local sellerCount = 0
+    local i
+
+    for i = 1, table.getn(listings) do
+        local listing = listings[i]
+
+        if listing and listing.unitPrice
+           and listing.unitPrice >= marketFloor
+           and listing.unitPrice <= maxClusterPrice
+           and listing.owner
+           and listing.owner ~= "" then
+            local ownerKey = lower(listing.owner)
+            local isMine =
+                playerName
+                and ownerKey == lower(playerName)
+
+            if not isMine then
+                listingCount = listingCount + 1
+
+                if not sellers[ownerKey] then
+                    sellers[ownerKey] = true
+                    sellerCount = sellerCount + 1
+                end
+            end
+        end
+    end
+
+    return listingCount, sellerCount
+end
+
+function JAP:IsFlaskPriceFailsafeTriggered(name, marketPrice)
+    if not name or not marketPrice or marketPrice <= 0 then
+        return false, nil, 0
+    end
+
+    local reference, samples =
+        getFlaskFailsafeReference(name)
+
+    if not reference or reference <= 0 then
+        return false, nil, samples
+    end
+
+    local drop = reference - marketPrice
+
+    if drop > FLASK_PRICE_FAILSAFE_COPPER then
+        return true, reference, samples
+    end
+
+    return false, reference, samples
 end
 
 local function productIndexText(name)
@@ -2069,25 +2249,51 @@ end
 function JAP:CancelAuctionWatchUndercut()
     local targets = {}
     local results = self:GetAuctionWatchDisplayResults()
-    local count = 0
+    local productCount = 0
+    local listingCount = 0
     local i
 
-    -- Use exactly the results currently shown in the My Auctions table.
-    -- This avoids an internal stale-table mismatch where visible UNDERCUT
-    -- rows existed but auctionWatchResults no longer contained them.
+    -- Cancel Undercut works on INDIVIDUAL owner listings now. A product can
+    -- still be CHEAPEST overall because our lowest auction beats the market,
+    -- while some of our more expensive auctions of the same product are
+    -- already undercut. Store the cheapest competitor as the per-item cutoff.
     for i = 1, table.getn(results) do
         local result = results[i]
-        if result and result.key and result.status == "undercut" then
-            targets[result.key] = true
-            count = count + 1
+        if result and result.key and result.competitorBest then
+            local own = self.auctionWatchOwn[result.key]
+            local undercutForProduct = 0
+            local stackIndex
+
+            for stackIndex = 1, table.getn((own and own.stacks) or {}) do
+                local stack = own.stacks[stackIndex]
+                if stack and stack.unitPrice
+                   and stack.unitPrice > result.competitorBest then
+                    undercutForProduct = undercutForProduct + 1
+                end
+            end
+
+            if undercutForProduct > 0 then
+                -- Numeric target value = per-item competitor cutoff. Selected
+                -- cancellation still uses boolean true and therefore cancels
+                -- every auction of the selected product type.
+                targets[result.key] = result.competitorBest
+                productCount = productCount + 1
+                listingCount = listingCount + undercutForProduct
+            end
         end
     end
 
-    if count == 0 then
-        chat("No undercut product types are currently shown.")
-        setStatus("Nothing to cancel: no visible undercut products found.")
+    if listingCount == 0 then
+        chat("No individual owner listings are currently undercut.")
+        setStatus("Nothing to cancel: all your individual listings are competitive.")
         return
     end
+
+    chat(
+        "Cancelling " .. listingCount ..
+        " undercut auction(s) across " .. productCount ..
+        " product type(s); cheapest own listings will stay posted."
+    )
 
     self:StartAuctionWatchCancelTargets(targets, "undercut")
 end
@@ -2228,6 +2434,15 @@ function JAP:FinishAuctionWatchCancel()
 
     chat(text)
 
+    if self.autoFlasksRunning
+       and self.autoFlasksPhase == "cancelling"
+       and self.auctionWatchCancelMode == nil then
+        -- auctionWatchCancelMode is cleared above; Auto Flasks phase is the
+        -- authoritative workflow state here.
+        self:ContinueAutoFlasksAfterCancellation()
+        return
+    end
+
     -- Keep ONLY the market comparison data temporarily. The visible owner
     -- list itself is deliberately destroyed right now so stale rows can
     -- never remain on screen after a cancellation.
@@ -2275,7 +2490,37 @@ function JAP:ProcessAuctionWatchCancelOwnerList()
 
         local key = name and normalizeKey(name) or nil
 
-        if key and self.auctionWatchCancelTargets[key] then
+        local cancelTarget = key and self.auctionWatchCancelTargets[key]
+        local shouldCancel = false
+
+        if cancelTarget then
+            if (self.auctionWatchCancelMode == "undercut"
+                or self.auctionWatchCancelMode == "auto-flasks")
+               and type(cancelTarget) == "number" then
+                local unitPrice = nil
+                if buyoutPrice and buyoutPrice > 0
+                   and count and count > 0 then
+                    unitPrice = buyoutPrice / count
+                end
+
+                -- Auto Flasks is more aggressive than manual Cancel
+                -- Undercut: it removes BOTH undercut and tied Flask listings,
+                -- leaving only strictly cheaper listings in place.
+                local roundedUnit =
+                    unitPrice and math.floor(unitPrice + 0.5) or nil
+                local roundedTarget =
+                    math.floor(cancelTarget + 0.5)
+
+                shouldCancel =
+                    roundedUnit ~= nil and roundedUnit >= roundedTarget
+            else
+                -- Cancel Selected intentionally removes every owner auction of
+                -- each selected product type.
+                shouldCancel = true
+            end
+        end
+
+        if shouldCancel then
             self.auctionWatchCancelEmptyPasses = 0
             self.auctionWatchCancelWaiting = true
             self.auctionWatchCancelCurrentName = name
@@ -2477,11 +2722,27 @@ function JAP:ProcessAuctionWatchOwnerPage()
     local key, own
     local typeCount = 0
     for key, own in pairs(self.auctionWatchOwn) do
-        items[key] = {
-            name = own.name,
-            itemKind = "product"
-        }
-        typeCount = typeCount + 1
+        local includeInScan = true
+
+        if self.autoFlasksRunning
+           and own.name
+           and string.find(
+               normalizeKey(own.name),
+               "flask",
+               1,
+               true
+           )
+           and not self:IsFlaskAutomationEnabled(own.name) then
+            includeInScan = false
+        end
+
+        if includeInScan then
+            items[key] = {
+                name = own.name,
+                itemKind = "product"
+            }
+            typeCount = typeCount + 1
+        end
     end
 
     if self.auctionWatchOwnerRefreshOnly then
@@ -2502,6 +2763,7 @@ function JAP:ProcessAuctionWatchOwnerPage()
                     competitorBest = oldResult.competitorBest,
                     competitorOwner = oldResult.competitorOwner,
                     competitorCount = oldResult.competitorCount,
+                    ownUndercutCount = oldResult.ownUndercutCount,
                     status = oldResult.status,
                     checkedAt = oldResult.checkedAt
                 }
@@ -2537,6 +2799,17 @@ function JAP:ProcessAuctionWatchOwnerPage()
         setStatus("No current Potion/Elixir/Flask auctions found.")
         chat("No current Alchemy product auctions were found in your owner list.")
         self:RefreshUI()
+
+        -- Auto Flasks must continue even when NONE of the enabled Flask types
+        -- are currently listed by us. In that case GetAutoFlasksTopUpNeeds()
+        -- will discover enabled Flasks in the bags, StartFlaskTopUp() will
+        -- scan their live market prices, and JAP will post up to the selected
+        -- target quantity.
+        if self.autoFlasksRunning
+           and self.autoFlasksPhase == "checking" then
+            self:ContinueAutoFlasksAfterInitialCheck()
+        end
+
         return
     end
 
@@ -2587,6 +2860,18 @@ function JAP:FinalizeAuctionWatchItem(scan)
         end
     end
 
+    local ownUndercutCount = 0
+    if competitorBest ~= nil then
+        local ownStackIndex
+        for ownStackIndex = 1, table.getn(own.stacks or {}) do
+            local ownStack = own.stacks[ownStackIndex]
+            if ownStack and ownStack.unitPrice
+               and ownStack.unitPrice > competitorBest then
+                ownUndercutCount = ownUndercutCount + 1
+            end
+        end
+    end
+
     local result = {
         key = own.key,
         name = own.name,
@@ -2597,6 +2882,7 @@ function JAP:FinalizeAuctionWatchItem(scan)
         competitorBest = competitorBest,
         competitorOwner = competitorOwner,
         competitorCount = competitorCount,
+        ownUndercutCount = ownUndercutCount,
         status = status,
         checkedAt = time()
     }
@@ -2734,12 +3020,26 @@ function JAP:AuctionWatchDetailText()
         table.insert(lines, "|cffffff55TIED|r = competitor matches your lowest price.")
         table.insert(lines, "|cffff5555UNDERCUT|r = a competitor is cheaper.")
         table.insert(lines, "")
-        table.insert(lines, "Warnings are grouped per potion/elixir/flask type.")
+        table.insert(lines, "Warnings are grouped per potion/elixir/flask type. Cancel Undercut still checks each individual owner listing.")
         table.insert(lines, "")
         table.insert(lines, "|cffffd100Cancel actions:|r")
         table.insert(lines, "Cancel Selected removes all auctions of every selected type.")
         table.insert(lines, "Ctrl/Shift-click adds or removes products from the selection.")
-        table.insert(lines, "Cancel Undercut removes all your auctions for UNDERCUT types.")
+        table.insert(lines, "Cancel Undercut removes only individual owner listings priced above the cheapest competitor; your cheaper listings stay posted.")
+        table.insert(lines, "")
+        table.insert(lines, "|cffffd100Flask Top Up:|r")
+        table.insert(lines, "Choose how many of each flask you want at your lowest price.")
+        table.insert(lines, "Existing own flasks already at that lowest price count toward the target.")
+        table.insert(lines, "JAP posts only the missing amount from your bags.")
+        table.insert(lines, "If your own listing is already cheapest, JAP keeps that price and does not undercut itself.")
+        table.insert(lines, "Otherwise new flasks are posted 1c below the cheapest competitor.")
+        table.insert(lines, "")
+        table.insert(lines, "|cffffd100Auto Flasks:|r")
+        table.insert(lines, "Runs a fresh My Auctions check, cancels only individually undercut Flask listings, reports removed/remaining quantities, tops up to the configured target, then runs one final fresh check.")
+        table.insert(lines, "Potions and Elixirs are never cancelled by Auto Flasks.")
+        table.insert(lines, "Unchecked Flask types in the Auto/Top Up filter are never scanned/cancelled/relisted/topped up by Flask automation.")
+        table.insert(lines, "Enable the Timer checkbox to repeat Auto Flasks automatically at the configured minute interval while the Auction House is open.")
+        table.insert(lines, "If bag stock cannot refill the configured target, JAP prints the exact shortage and plays a repeated warning alarm.")
         table.insert(lines, "Auctions with active bids are also cancelled; WoW may charge its cancellation fee.")
         table.insert(lines, "Cancelled items return through the Auction House mailbox.")
     end
@@ -2869,6 +3169,11 @@ function JAP:StartScan(
     self.scanRunning = true
     self.currentScan = nil
     self.pendingQuery = nil
+    self.scanQueryInFlight = false
+    self.scanQuerySentAt = 0
+    self.lastAuctionResponseAt = 0
+    self.fastAuctionResponses = 0
+    self.normalAuctionResponses = 0
 
     if self.scanTotal == 0 then
         self.scanRunning = false
@@ -2881,7 +3186,10 @@ function JAP:StartScan(
 
     local scanScope = self.productsOnly and "crafted potion prices only" or "potions and ingredients"
 
-    if mode == "auction-watch" then
+    if mode == "flask-topup-scan" then
+        chat("Scanning current flask prices for Flask Top Up.")
+        setStatus("Scanning flask prices for Top Up...")
+    elseif mode == "auction-watch" then
         chat("Scanning competitors for your current Alchemy auctions.")
         setStatus("Checking whether your auctions are still cheapest...")
     elseif mode == "production-buy" then
@@ -2970,12 +3278,46 @@ function JAP:StartNextItem()
         self.scanRunning = false
         self.currentScan = nil
         self.pendingQuery = nil
+        self.scanQueryInFlight = false
+        self.scanQuerySentAt = 0
 
         self:ClearActiveRecipeScanTracking()
 
         self:RecalculateLiveResultsThrottled(true)
 
-        if completedMode == "auction-watch" then
+        if completedMode == "flask-topup-scan"
+           and self.flaskTopUpScanPending then
+            self.flaskTopUpScanPending = false
+
+            local queued = self:BuildFlaskTopUpPostQueue()
+
+            if queued > 0 then
+                self.flaskTopUpRunning = true
+                self.productionPostRunning = true
+                self.productionPostPending = nil
+                self.productionPostStage = nil
+                self.productionPostNextAt = now()
+
+                setStatus(
+                    "Flask Top Up: posting " ..
+                    queued .. " flask(s)."
+                )
+            else
+                setStatus(
+                    "Flask Top Up complete: target already met " ..
+                    "or no market reference was found."
+                )
+                chat("Flask Top Up: nothing needs to be posted.")
+
+                if self.autoFlasksRunning
+                   and self.autoFlasksPhase == "topup" then
+                    self.autoFlasksPhase = "final-check"
+                    self:ScheduleFreshMyAuctionsCheckAfterFlaskTopUp()
+                end
+            end
+
+            return
+        elseif completedMode == "auction-watch" then
             self.auctionWatchLastCheck = time()
 
             local results = self:GetAuctionWatchDisplayResults()
@@ -3002,6 +3344,17 @@ function JAP:StartNextItem()
             end
 
             self:RefreshUI()
+
+            if self.autoFlasksRunning
+               and self.autoFlasksPhase == "checking" then
+                self:ContinueAutoFlasksAfterInitialCheck()
+                return
+            elseif self.autoFlasksRunning
+               and self.autoFlasksPhase == "final-check" then
+                self:FinishAutoFlasks()
+                return
+            end
+
             self:PlayCompletionSound("scan")
             return
         elseif completedMode == "production-buy" then
@@ -3027,8 +3380,20 @@ function JAP:StartNextItem()
             return
         end
 
-        setStatus("Scan complete: " .. self.scanDone .. "/" .. self.scanTotal .. " items.")
-        chat("Auction scan complete. Scanned " .. self.scanDone .. " unique item(s).")
+        local speedText = ""
+        if (self.fastAuctionResponses or 0) >
+           (self.normalAuctionResponses or 0) then
+            speedText = " Fast-response mode active."
+        end
+
+        setStatus(
+            "Scan complete: " .. self.scanDone .. "/" ..
+            self.scanTotal .. " items." .. speedText
+        )
+        chat(
+            "Auction scan complete. Scanned " ..
+            self.scanDone .. " unique item(s)." .. speedText
+        )
         self:PlayCompletionSound("scan")
         return
     end
@@ -3051,6 +3416,16 @@ function JAP:StartNextItem()
     self:QueueCurrentPage()
 end
 
+function JAP:GetAdaptiveAuctionQueryDelay()
+    if self.lastAuctionResponseAt
+       and self.lastAuctionResponseAt > 0
+       and not self.scanQueryInFlight then
+        return self.fastQueryDelay or 0.01
+    end
+
+    return self.queryDelay or 0.05
+end
+
 function JAP:QueueCurrentPage()
     if not self.currentScan then return end
     self.pendingQuery = {
@@ -3062,14 +3437,20 @@ end
 
 function JAP:SendPendingQuery()
     if not self.pendingQuery or not self.scanRunning then return end
+    if self.scanQueryInFlight then return end
+
     if not AuctionFrame or not AuctionFrame:IsVisible() then
         self:CancelScan("Auction House was closed.")
         return
     end
 
-    local elapsed = now() - self.lastQueryAt
-    if elapsed < self.queryDelay then return end
+    local elapsed = now() - (self.lastQueryAt or 0)
+    local queryDelay = self:GetAdaptiveAuctionQueryDelay()
+    if elapsed < queryDelay then return end
 
+    -- CanSendAuctionQuery stays authoritative:
+    -- stock Vanilla/Turtle keeps its normal throttle,
+    -- while AuctionQueryThrottle can make it ready immediately after a reply.
     local canSend = true
     if CanSendAuctionQuery then
         local queryReady = CanSendAuctionQuery()
@@ -3081,8 +3462,22 @@ function JAP:SendPendingQuery()
 
     local query = self.pendingQuery
     self.pendingQuery = nil
-    self.lastQueryAt = now()
-    QueryAuctionItems(query.name, "", "", 0, 0, 0, query.page, false)
+
+    local sentAt = now()
+    self.lastQueryAt = sentAt
+    self.scanQuerySentAt = sentAt
+    self.scanQueryInFlight = true
+
+    QueryAuctionItems(
+        query.name,
+        "",
+        "",
+        0,
+        0,
+        0,
+        query.page,
+        false
+    )
 end
 
 function JAP:ProcessAuctionPage()
@@ -3097,6 +3492,22 @@ function JAP:ProcessAuctionPage()
 
     if not self.scanRunning or not self.currentScan then return end
     if self.pendingQuery then return end
+
+    local responseAt = now()
+    local responseTime =
+        responseAt - (self.scanQuerySentAt or responseAt)
+
+    self.lastAuctionResponseAt = responseAt
+    self.scanQueryInFlight = false
+    self.scanQuerySentAt = 0
+
+    if responseTime > 0 and responseTime < 1.00 then
+        self.fastAuctionResponses =
+            (self.fastAuctionResponses or 0) + 1
+    else
+        self.normalAuctionResponses =
+            (self.normalAuctionResponses or 0) + 1
+    end
 
     local batchCount, totalCount = GetNumAuctionItems("list")
     batchCount = batchCount or 0
@@ -3166,7 +3577,8 @@ function JAP:ProcessAuctionPage()
                 if self.scanMode == "production-buy"
                    or self.scanMode == "production-materials"
                    or self.scanMode == "production-post-scan"
-                   or self.scanMode == "auction-watch" then
+                   or self.scanMode == "auction-watch"
+                   or self.scanMode == "flask-topup-scan" then
                     table.insert(self.currentScan.listings, {
                         name = name,
                         itemId = auctionId,
@@ -3207,7 +3619,10 @@ function JAP:ProcessAuctionPage()
             self.currentScan
         )
 
-        if self.scanMode == "auction-watch" then
+        if self.scanMode == "flask-topup-scan" then
+            self.flaskTopUpLiveListings[self.currentScan.key] =
+                self.currentScan.listings or {}
+        elseif self.scanMode == "auction-watch" then
             self:FinalizeAuctionWatchItem(self.currentScan)
         elseif self.scanMode == "production-buy" then
             self.productionBuyCandidates[self.currentScan.key] =
@@ -3274,6 +3689,8 @@ function JAP:CancelScan(reason)
     self.scanRunning = false
     self.currentScan = nil
     self.pendingQuery = nil
+    self.scanQueryInFlight = false
+    self.scanQuerySentAt = 0
     clearArray(self.scanQueue)
     self:ClearActiveRecipeScanTracking()
 
@@ -3283,6 +3700,9 @@ function JAP:CancelScan(reason)
         self.productionBuyCandidates = {}
     elseif cancelledMode == "production-post-scan" then
         self.productionPostScanPending = false
+    elseif cancelledMode == "flask-topup-scan" then
+        self.flaskTopUpScanPending = false
+        self.flaskTopUpRunning = false
     end
 
     setStatus(reason or "Scan cancelled.")
@@ -3391,6 +3811,17 @@ end
 function JAP:ApplyDefaultTableLayout()
     self:PositionColumnHeaders(-188)
 
+    if self.statusText then
+        self.statusText:ClearAllPoints()
+        self.statusText:SetPoint(
+            "TOPLEFT",
+            self.frame,
+            "TOPLEFT",
+            22,
+            -174
+        )
+    end
+
     local i
     for i = 1, self.visibleRows do
         local row = self.rows[i]
@@ -3426,6 +3857,17 @@ function JAP:ApplyAuctionWatchTableLayout()
     local positions = {24, 245, 345, 445}
     local i
 
+    if self.statusText then
+        self.statusText:ClearAllPoints()
+        self.statusText:SetPoint(
+            "TOPLEFT",
+            self.frame,
+            "TOPLEFT",
+            22,
+            -194
+        )
+    end
+
     for i = 1, 4 do
         self.columnHeaders[i]:ClearAllPoints()
         self.columnHeaders[i]:SetPoint(
@@ -3433,7 +3875,7 @@ function JAP:ApplyAuctionWatchTableLayout()
             self.frame,
             "TOPLEFT",
             positions[i],
-            -206
+            -255
         )
     end
 
@@ -3446,7 +3888,7 @@ function JAP:ApplyAuctionWatchTableLayout()
             self.frame,
             "TOPLEFT",
             20,
-            -226 - ((i - 1) * 27)
+            -275 - ((i - 1) * 27)
         )
 
         row.name:ClearAllPoints()
@@ -3470,6 +3912,17 @@ end
 function JAP:ApplyProductionTableLayout()
     local positions = {24, 150, 300, 405}
     local i
+
+    if self.statusText then
+        self.statusText:ClearAllPoints()
+        self.statusText:SetPoint(
+            "TOPLEFT",
+            self.frame,
+            "TOPLEFT",
+            22,
+            -174
+        )
+    end
 
     for i = 1, 4 do
         self.columnHeaders[i]:ClearAllPoints()
@@ -3559,6 +4012,8 @@ function JAP:RefreshUI()
         local controls = self.auctionWatchControls or {}
         for i = 1, table.getn(controls) do controls[i]:Show() end
 
+        self:RefreshFlaskAutomationFilterControls()
+
         self.columnHeaders[1]:SetText("My product")
         self.columnHeaders[2]:SetText("My lowest")
         self.columnHeaders[3]:SetText("Competitor")
@@ -3588,7 +4043,9 @@ function JAP:RefreshUI()
                     row.market:SetText("-")
                 end
 
-                if result.status == "undercut" then
+                if not self:IsFlaskAutomationEnabled(result.name) then
+                    row.profit:SetText("|cff999999DISABLED|r")
+                elseif result.status == "undercut" then
                     row.profit:SetText("|cffff5555UNDERCUT|r")
                 elseif result.status == "tied" then
                     row.profit:SetText("|cffffff55TIED|r")
@@ -3645,7 +4102,11 @@ function JAP:RefreshUI()
                 local selectedResult = selectedResults[selectedIndex]
                 local statusText = "CHECKING"
 
-                if selectedResult.status == "undercut" then
+                if not self:IsFlaskAutomationEnabled(
+                    selectedResult.name
+                ) then
+                    statusText = "|cff999999DISABLED|r"
+                elseif selectedResult.status == "undercut" then
                     statusText = "|cffff5555UNDERCUT|r"
                 elseif selectedResult.status == "tied" then
                     statusText = "|cffffff55TIED|r"
@@ -3680,6 +4141,15 @@ function JAP:RefreshUI()
             end
 
             table.insert(lines, "")
+
+            if (result.ownUndercutCount or 0) > 0 then
+                table.insert(
+                    lines,
+                    "|cffff7777Your undercut listings: " ..
+                    tostring(result.ownUndercutCount) .. "|r"
+                )
+                table.insert(lines, "")
+            end
 
             if result.status == "undercut" then
                 table.insert(lines, "|cffff5555STATUS: UNDERCUT|r")
@@ -6370,6 +6840,1114 @@ function JAP:ProductionPostAll()
 end
 
 
+function JAP:TriggerFlaskShortageAlarm(flaskName, needed, available, target)
+    local missingAfterBags =
+        math.max(0, (needed or 0) - (available or 0))
+
+    local text =
+        "WARNING: Not enough " ..
+        tostring(flaskName or "Flasks") ..
+        " in bags to reach target " ..
+        tostring(target or self:GetFlaskTopUpTarget()) ..
+        ". Need " .. tostring(needed or 0) ..
+        ", bag has " .. tostring(available or 0) ..
+        ", still short " .. tostring(missingAfterBags) .. "."
+
+    chat("|cffff2020" .. text .. "|r")
+    setStatus(text)
+
+    if UIErrorsFrame and UIErrorsFrame.AddMessage then
+        UIErrorsFrame:AddMessage(
+            "NOT ENOUGH FLASKS IN BAG!",
+            1,
+            0.1,
+            0.1,
+            1.0
+        )
+    end
+
+    -- Repeat a strong built-in warning sound several times. This is kept
+    -- separate from the optional normal completion-sound setting.
+    self.flaskShortageAlarmRemaining = 4
+    self.flaskShortageAlarmNextAt = now()
+end
+
+function JAP:ProcessFlaskShortageAlarm()
+    if (self.flaskShortageAlarmRemaining or 0) <= 0 then return end
+    if now() < (self.flaskShortageAlarmNextAt or 0) then return end
+
+    if PlaySound then
+        PlaySound("RaidWarning")
+        PlaySound("TellMessage")
+    end
+
+    self.flaskShortageAlarmRemaining =
+        self.flaskShortageAlarmRemaining - 1
+    self.flaskShortageAlarmNextAt = now() + 0.55
+end
+
+function JAP:IsFlaskAutomationEnabled(name)
+    if not name then return false end
+
+    local key = normalizeKey(name)
+    local enabled =
+        db().settings.flaskAutomationEnabled[key]
+
+    -- Missing entry means enabled so existing users keep current behavior.
+    return enabled ~= false
+end
+
+function JAP:SetFlaskAutomationEnabled(name, enabled)
+    if not name then return end
+
+    local key = normalizeKey(name)
+    db().settings.flaskAutomationEnabled[key] =
+        enabled == true
+
+    chat(
+        tostring(name) ..
+        (enabled and
+            ": included in Auto/Top Up Flasks." or
+            ": excluded from Auto/Top Up Flasks.")
+    )
+
+    self:RefreshFlaskAutomationFilterControls()
+
+    if self.currentPage == "auction-watch" then
+        self:RefreshUI()
+    end
+end
+
+function JAP:GetKnownFlaskAutomationNames()
+    -- Flask automation intentionally exposes only these three main Flask
+    -- types. Other Flask recipes remain visible in normal My Auctions, but
+    -- are never part of this inclusion filter.
+    return {
+        "Flask of Supreme Power",
+        "Flask of Distilled Wisdom",
+        "Flask of the Titans"
+    }
+end
+
+function JAP:GetShortFlaskAutomationName(name)
+    if name == "Flask of Supreme Power" then
+        return "Supreme"
+    end
+    if name == "Flask of Distilled Wisdom" then
+        return "Wisdom"
+    end
+    if name == "Flask of the Titans" then
+        return "Titans"
+    end
+
+    return tostring(name or "")
+end
+
+function JAP:RefreshFlaskAutomationFilterControls()
+    local slots = self.flaskAutomationFilterSlots or {}
+    local names = self:GetKnownFlaskAutomationNames()
+    local i
+
+    for i = 1, table.getn(slots) do
+        local slot = slots[i]
+        local name = names[i]
+
+        if name then
+            slot.check.flaskName = name
+            slot.label:SetText(
+                self:GetShortFlaskAutomationName(name)
+            )
+            slot.check:SetChecked(
+                self:IsFlaskAutomationEnabled(name) and 1 or 0
+            )
+
+            if self.currentPage == "auction-watch" then
+                slot.check:Show()
+                slot.label:Show()
+            end
+        else
+            slot.check.flaskName = nil
+            slot.check:Hide()
+            slot.label:Hide()
+        end
+    end
+end
+
+function JAP:GetFlaskTopUpTarget()
+    local value = tonumber(
+        self.flaskTopUpTargetEdit and
+        self.flaskTopUpTargetEdit:GetText()
+    )
+
+    if not value then
+        value = tonumber(db().settings.flaskTopUpTarget) or 3
+    end
+
+    value = math.floor(value)
+    if value < 1 then value = 1 end
+    if value > 99 then value = 99 end
+
+    self.flaskTopUpTarget = value
+    db().settings.flaskTopUpTarget = value
+
+    if self.flaskTopUpTargetEdit then
+        self.flaskTopUpTargetEdit:SetText(tostring(value))
+    end
+
+    return value
+end
+
+function JAP:ReadFlasksInBags()
+    local flasks = {}
+    local bag
+
+    for bag = 0, 4 do
+        local slots = GetContainerNumSlots and
+            GetContainerNumSlots(bag) or 0
+        local slot
+
+        for slot = 1, slots do
+            local link = GetContainerItemLink and
+                GetContainerItemLink(bag, slot) or nil
+
+            if link then
+                local name = getItemNameFromLink(link)
+                local texture, count =
+                    GetContainerItemInfo(bag, slot)
+
+                if name and count and count > 0
+                   and string.find(
+                       normalizeKey(name),
+                       "flask",
+                       1,
+                       true
+                   )
+                   and self:IsFlaskAutomationEnabled(name) then
+                    local key = normalizeKey(name)
+                    local entry = flasks[key]
+
+                    if not entry then
+                        entry = {
+                            key = key,
+                            name = name,
+                            itemId = getItemId(link),
+                            bagCount = 0
+                        }
+                        flasks[key] = entry
+                    end
+
+                    entry.bagCount = entry.bagCount + count
+                end
+            end
+        end
+    end
+
+    return flasks
+end
+
+function JAP:ReadCurrentFlaskOwnerSnapshot()
+    local snapshot = {}
+    local batchCount, totalCount =
+        GetNumAuctionItems("owner")
+
+    batchCount = batchCount or 0
+    totalCount = totalCount or batchCount
+
+    local ownerCount = totalCount
+    if ownerCount < batchCount then ownerCount = batchCount end
+
+    local index
+    for index = 1, ownerCount do
+        local name, texture, count, quality, canUse, level,
+              minBid, minIncrement, buyoutPrice, bidAmount,
+              highBidder, owner =
+              GetAuctionItemInfo("owner", index)
+
+        if name and count and count > 0
+           and buyoutPrice and buyoutPrice > 0
+           and string.find(
+               normalizeKey(name),
+               "flask",
+               1,
+               true
+           ) then
+            local key = normalizeKey(name)
+            local unitPrice = buyoutPrice / count
+            local entry = snapshot[key]
+
+            if not entry then
+                entry = {
+                    key = key,
+                    name = name,
+                    lowest = unitPrice,
+                    auctionCount = 0,
+                    itemCount = 0,
+                    stacks = {}
+                }
+                snapshot[key] = entry
+            end
+
+            entry.auctionCount = entry.auctionCount + 1
+            entry.itemCount = entry.itemCount + count
+            if unitPrice < entry.lowest then
+                entry.lowest = unitPrice
+            end
+
+            table.insert(entry.stacks, {
+                count = count,
+                buyout = buyoutPrice,
+                unitPrice = unitPrice
+            })
+        end
+    end
+
+    return snapshot
+end
+
+function JAP:CopyFlaskOwnerSnapshot(snapshot)
+    local copy = {}
+    local key, entry
+
+    for key, entry in pairs(snapshot or {}) do
+        copy[key] = {
+            key = key,
+            name = entry.name,
+            lowest = entry.lowest,
+            auctionCount = entry.auctionCount or 0,
+            itemCount = entry.itemCount or 0
+        }
+    end
+
+    return copy
+end
+
+function JAP:StartAutoFlasks()
+    if self.autoFlasksRunning then
+        chat("Auto Flasks is already running.")
+        return
+    end
+
+    if self.scanRunning or self.productionPostRunning
+       or self.productionBuyRunning
+       or self.auctionWatchCancelRunning
+       or self.auctionWatchOwnerScanRunning
+       or self.flaskTopUpScanPending
+       or (self.flaskTopUpPrepareAt or 0) > 0 then
+        chat("Finish the current Auction House operation first.")
+        return
+    end
+
+    if not AuctionFrame or not AuctionFrame:IsVisible() then
+        chat("Open the Auction House first.")
+        setStatus("Open the Auction House before starting Auto Flasks.")
+        return
+    end
+
+    local target = self:GetFlaskTopUpTarget()
+
+    self.autoFlasksRunning = true
+    self.autoFlasksPhase = "checking"
+    self.autoFlasksInitialOwner = {}
+    self.autoFlasksTargetKeys = {}
+    self.autoFlasksCancelledItems = 0
+    self.autoFlasksCancelledAuctions = 0
+    self.autoFlasksPosted = 0
+
+    chat(
+        "Auto Flasks started. Target at lowest price: " ..
+        target .. " per Flask type."
+    )
+    setStatus(
+        "Auto Flasks: checking your auctions and competitors..."
+    )
+
+    self:StartAuctionWatch()
+end
+
+function JAP:BuildAutoFlaskUndercutTargets()
+    local targets = {}
+    local targetKeys = {}
+    local listingCount = 0
+    local productCount = 0
+    local results = self:GetAuctionWatchDisplayResults()
+    local i
+
+    self.autoFlasksInitialOwner =
+        self:CopyFlaskOwnerSnapshot(
+            self:ReadCurrentFlaskOwnerSnapshot()
+        )
+
+    for i = 1, table.getn(results) do
+        local result = results[i]
+
+        if result and result.key and result.name
+           and result.competitorBest
+           and string.find(
+               normalizeKey(result.name),
+               "flask",
+               1,
+               true
+           )
+           and self:IsFlaskAutomationEnabled(result.name) then
+            local own = self.auctionWatchOwn[result.key]
+            local undercutForProduct = 0
+            local stackIndex
+            local competitorUnit =
+                math.floor((result.competitorBest or 0) + 0.5)
+
+            for stackIndex = 1, table.getn((own and own.stacks) or {}) do
+                local stack = own.stacks[stackIndex]
+                local ownUnit =
+                    math.floor((stack and stack.unitPrice or 0) + 0.5)
+
+                if stack and stack.unitPrice
+                   and ownUnit >= competitorUnit then
+                    -- Auto Flasks treats BOTH undercut and tied Flask
+                    -- listings as removable. Only strictly cheaper listings
+                    -- stay in place.
+                    undercutForProduct =
+                        undercutForProduct + 1
+                end
+            end
+
+            if undercutForProduct > 0 then
+                targets[result.key] = result.competitorBest
+                targetKeys[result.key] = true
+                listingCount =
+                    listingCount + undercutForProduct
+                productCount = productCount + 1
+            end
+        end
+    end
+
+    self.autoFlasksTargetKeys = targetKeys
+
+    return targets, listingCount, productCount
+end
+
+function JAP:GetAutoFlasksTopUpNeeds()
+    local target = self:GetFlaskTopUpTarget()
+    local bagFlasks = self:ReadFlasksInBags()
+    local results = self:GetAuctionWatchDisplayResults()
+    local resultByKey = {}
+    local needs = {}
+    local i
+
+    for i = 1, table.getn(results) do
+        local result = results[i]
+        if result and result.key then
+            resultByKey[result.key] = result
+        end
+    end
+
+    -- Inspect every Flask already posted. Collect ALL Flask types that are
+    -- below the configured target and for which at least one bag Flask exists.
+    local key, own
+    for key, own in pairs(self.auctionWatchOwn or {}) do
+        if own and own.name
+           and string.find(
+               normalizeKey(own.name),
+               "flask",
+               1,
+               true
+           ) then
+            local result = resultByKey[key]
+            local competitorBest =
+                result and result.competitorBest or nil
+            local desiredPrice = nil
+
+            if own.myLowest then
+                if competitorBest == nil
+                   or own.myLowest <= competitorBest then
+                    desiredPrice =
+                        math.max(
+                            1,
+                            math.floor(own.myLowest + 0.5)
+                        )
+                elseif competitorBest then
+                    desiredPrice =
+                        math.max(
+                            1,
+                            math.floor(competitorBest) - 1
+                        )
+                end
+            end
+
+            local atLowest = 0
+            if desiredPrice and own.stacks then
+                local stackIndex
+                for stackIndex = 1, table.getn(own.stacks) do
+                    local stack = own.stacks[stackIndex]
+                    local stackUnit =
+                        math.floor(
+                            (stack.unitPrice or 0) + 0.5
+                        )
+
+                    if stackUnit == desiredPrice then
+                        atLowest =
+                            atLowest + (stack.count or 1)
+                    end
+                end
+            end
+
+            if atLowest < target then
+                local bagEntry = bagFlasks[key]
+
+                if bagEntry and (bagEntry.bagCount or 0) > 0 then
+                    needs[key] = {
+                        key = key,
+                        name = own.name,
+                        atLowest = atLowest,
+                        target = target,
+                        bagCount = bagEntry.bagCount or 0
+                    }
+                end
+            end
+        end
+    end
+
+    -- Flask types present in bags but not currently posted also need a price
+    -- scan. This includes the important zero-own-auctions case: Auto Flasks
+    -- should establish fresh listings up to the configured target from bags.
+    -- Collect all matching enabled Flask types, not just the first one.
+    local bagKey, bagEntry
+    for bagKey, bagEntry in pairs(bagFlasks or {}) do
+        if bagEntry and (bagEntry.bagCount or 0) > 0
+           and not (self.auctionWatchOwn or {})[bagKey] then
+            needs[bagKey] = {
+                key = bagKey,
+                name = bagEntry.name,
+                atLowest = 0,
+                target = target,
+                bagCount = bagEntry.bagCount or 0
+            }
+        end
+    end
+
+    return needs
+end
+
+function JAP:AutoFlasksNeedsTopUp()
+    local needs = self:GetAutoFlasksTopUpNeeds()
+    local key, need
+
+    for key, need in pairs(needs) do
+        return true, need.name, need.atLowest, needs
+    end
+
+    return false, nil, self:GetFlaskTopUpTarget(), needs
+end
+
+function JAP:ContinueAutoFlasksAfterInitialCheck()
+    if not self.autoFlasksRunning
+       or self.autoFlasksPhase ~= "checking" then
+        return false
+    end
+
+    local targets, listingCount, productCount =
+        self:BuildAutoFlaskUndercutTargets()
+
+    if listingCount > 0 then
+        self.autoFlasksPhase = "cancelling"
+
+        chat(
+            "Auto Flasks: removing " ..
+            listingCount .. " undercut/tied Flask auction(s) across " ..
+            productCount .. " Flask type(s)."
+        )
+        setStatus(
+            "Auto Flasks: cancelling undercut/tied Flask auctions..."
+        )
+
+        self:StartAuctionWatchCancelTargets(
+            targets,
+            "auto-flasks"
+        )
+    else
+        chat(
+            "Auto Flasks: no individually undercut or tied Flask auctions found."
+        )
+
+        local needsTopUp, flaskName, atLowest, topUpNeeds =
+            self:AutoFlasksNeedsTopUp()
+
+        if not needsTopUp then
+            -- The first check was already a complete fresh market check.
+            -- If nothing is undercut and every Flask target is already met,
+            -- there is no reason to scan the same auctions a second time.
+            self.autoFlasksRunning = false
+            self.autoFlasksPhase = nil
+            self.autoFlasksInitialOwner = {}
+            self.autoFlasksTargetKeys = {}
+            self.flaskTopUpFilterKeys = nil
+
+            local target = self:GetFlaskTopUpTarget()
+            local text =
+                "Auto Flasks complete: all Flask listings are competitive " ..
+                "and the target of " .. target ..
+                " at the lowest price is already met."
+
+            chat(text)
+            setStatus(text)
+            self:PlayCompletionSound("scan")
+
+            return true
+        end
+
+        local shortageTypes = 0
+        local needKey, need
+        for needKey, need in pairs(topUpNeeds or {}) do
+            shortageTypes = shortageTypes + 1
+            chat(
+                "Auto Flasks: Top Up needed for " ..
+                tostring(need.name) ..
+                " (" .. tostring(need.atLowest or 0) ..
+                "/" .. tostring(need.target or self:GetFlaskTopUpTarget()) ..
+                " currently at lowest; " ..
+                tostring(need.bagCount or 0) .. " in bags)."
+            )
+        end
+
+        self.autoFlasksPhase = "topup"
+
+        -- No cancellation occurred. Scan every Flask type that actually needs
+        -- stock, while skipping every already-complete Flask type.
+        self.flaskTopUpFilterKeys = {}
+        for needKey, need in pairs(topUpNeeds or {}) do
+            self.flaskTopUpFilterKeys[needKey] = true
+        end
+
+        if not self:StartFlaskTopUp() then
+            self.autoFlasksPhase = "final-check"
+            self:ScheduleFreshMyAuctionsCheckAfterFlaskTopUp()
+        end
+    end
+
+    return true
+end
+
+function JAP:ReportAutoFlasksCancellation()
+    local after =
+        self:ReadCurrentFlaskOwnerSnapshot()
+
+    local removedItems = 0
+    local removedAuctions = 0
+    local key, enabled
+
+    chat("|cffffd100Auto Flasks cancellation summary:|r")
+
+    for key, enabled in pairs(self.autoFlasksTargetKeys or {}) do
+        if enabled then
+            local before =
+                self.autoFlasksInitialOwner[key]
+            local current = after[key]
+
+            local beforeItems =
+                before and before.itemCount or 0
+            local afterItems =
+                current and current.itemCount or 0
+            local beforeAuctions =
+                before and before.auctionCount or 0
+            local afterAuctions =
+                current and current.auctionCount or 0
+
+            local removedForType =
+                math.max(0, beforeItems - afterItems)
+            local removedAuctionsForType =
+                math.max(
+                    0,
+                    beforeAuctions - afterAuctions
+                )
+
+            removedItems =
+                removedItems + removedForType
+            removedAuctions =
+                removedAuctions + removedAuctionsForType
+
+            local displayName =
+                (before and before.name)
+                or (current and current.name)
+                or key
+
+            chat(
+                displayName .. ": removed " ..
+                removedForType ..
+                " item(s) in " ..
+                removedAuctionsForType ..
+                " auction(s); " ..
+                afterItems .. " item(s) still listed."
+            )
+        end
+    end
+
+    self.autoFlasksCancelledItems = removedItems
+    self.autoFlasksCancelledAuctions = removedAuctions
+
+    chat(
+        "Auto Flasks: total removed " ..
+        removedItems .. " Flask item(s) in " ..
+        removedAuctions .. " auction(s). " ..
+        "Cancelled items return through the Auction House mailbox."
+    )
+end
+
+function JAP:ContinueAutoFlasksAfterCancellation()
+    if not self.autoFlasksRunning
+       or self.autoFlasksPhase ~= "cancelling" then
+        return false
+    end
+
+    self:ReportAutoFlasksCancellation()
+
+    self.autoFlasksPhase = "topup"
+
+    -- The initial Auto Flasks check already verified every other Flask.
+    -- After cancelling, only rescan the Flask types that were undercut.
+    self.flaskTopUpFilterKeys = {}
+    local filterKey, enabled
+
+    -- Rescan every Flask type that was cancelled.
+    for filterKey, enabled in pairs(self.autoFlasksTargetKeys or {}) do
+        if enabled then
+            self.flaskTopUpFilterKeys[filterKey] = true
+        end
+    end
+
+    -- Also include other Flask types that the initial fresh check already
+    -- proved were below target. This still skips every fully stocked Flask.
+    local topUpNeeds = self:GetAutoFlasksTopUpNeeds()
+    local needKey, need
+    for needKey, need in pairs(topUpNeeds or {}) do
+        self.flaskTopUpFilterKeys[needKey] = true
+    end
+
+    if not self:StartFlaskTopUp() then
+        local target = self:GetFlaskTopUpTarget()
+        local key, enabled
+
+        for key, enabled in pairs(self.autoFlasksTargetKeys or {}) do
+            if enabled then
+                local before = self.autoFlasksInitialOwner[key]
+                self:TriggerFlaskShortageAlarm(
+                    before and before.name or key,
+                    target,
+                    0,
+                    target
+                )
+            end
+        end
+
+        self.autoFlasksPhase = "final-check"
+        self:ScheduleFreshMyAuctionsCheckAfterFlaskTopUp()
+    end
+
+    return true
+end
+
+function JAP:FinishAutoFlasks()
+    if not self.autoFlasksRunning then return end
+
+    local posted = self.autoFlasksPosted or 0
+    local removedItems =
+        self.autoFlasksCancelledItems or 0
+    local removedAuctions =
+        self.autoFlasksCancelledAuctions or 0
+
+    self.autoFlasksRunning = false
+    self.autoFlasksPhase = nil
+    self.autoFlasksInitialOwner = {}
+    self.autoFlasksTargetKeys = {}
+    self.flaskTopUpFilterKeys = nil
+
+    local text =
+        "Auto Flasks complete: removed " ..
+        removedItems .. " Flask item(s) in " ..
+        removedAuctions .. " auction(s), posted " ..
+        posted .. " Flask(s), final market check complete."
+
+    chat(text)
+    setStatus(text)
+    self:PlayCompletionSound("post")
+
+end
+
+function JAP:StartFlaskTopUp()
+    if self.scanRunning or self.productionPostRunning
+       or self.flaskTopUpScanPending
+       or (self.flaskTopUpPrepareAt or 0) > 0 then
+        chat("Finish the current scan/posting operation first.")
+        return false
+    end
+
+    if not AuctionFrame or not AuctionFrame:IsVisible() then
+        chat("Open the Auction House first.")
+        setStatus("Open the Auction House before topping up flasks.")
+        return false
+    end
+
+    local target = self:GetFlaskTopUpTarget()
+    local bagFlasks = self:ReadFlasksInBags()
+
+    -- Manual Top Up considers every Flask in the bags. Auto Flasks can
+    -- provide a one-shot filter so only Flask types that actually need
+    -- attention are rescanned.
+    if self.flaskTopUpFilterKeys then
+        local filtered = {}
+        local filterKey, enabled
+
+        for filterKey, enabled in pairs(self.flaskTopUpFilterKeys) do
+            if enabled and bagFlasks[filterKey] then
+                filtered[filterKey] = bagFlasks[filterKey]
+            end
+        end
+
+        bagFlasks = filtered
+    end
+
+    local count = 0
+    local key, flask
+
+    for key, flask in pairs(bagFlasks) do
+        count = count + 1
+    end
+
+    if count == 0 then
+        self.flaskTopUpFilterKeys = nil
+        chat("No matching flasks were found in your bags.")
+        setStatus("No matching flasks found in bags.")
+        return false
+    end
+
+    self.flaskTopUpBagFlasks = bagFlasks
+    -- One-shot filter: a later manual Top Up must again include all Flasks.
+    self.flaskTopUpFilterKeys = nil
+    self.flaskTopUpOwner = {}
+    self.flaskTopUpLiveListings = {}
+    self.flaskTopUpPosted = 0
+
+    self:RequestOwnerAuctionList()
+    self.flaskTopUpPrepareAt = now() + 0.35
+
+    setStatus(
+        "Reading your current flask auctions before Top Up..."
+    )
+    chat(
+        "Flask Top Up: target " .. target ..
+        " item(s) at the lowest price per flask type."
+    )
+
+    return true
+end
+
+function JAP:ProcessFlaskTopUpPreparation()
+    local processAt = self.flaskTopUpPrepareAt or 0
+    if processAt <= 0 or now() < processAt then return end
+
+    self.flaskTopUpPrepareAt = 0
+
+    if not AuctionFrame or not AuctionFrame:IsVisible() then
+        setStatus("Flask Top Up stopped: Auction House was closed.")
+        return
+    end
+
+    self.flaskTopUpOwner = self:ReadCurrentFlaskOwnerSnapshot()
+
+    local items = {}
+    local key, flask
+    for key, flask in pairs(self.flaskTopUpBagFlasks or {}) do
+        if flask.bagCount and flask.bagCount > 0 then
+            items[key] = {
+                name = flask.name,
+                itemId = flask.itemId,
+                itemKind = "product"
+            }
+        end
+    end
+
+    if next(items) == nil then
+        setStatus("No flasks available for Top Up.")
+        return
+    end
+
+    self.flaskTopUpScanPending = true
+    self.flaskTopUpLiveListings = {}
+
+    self:StartScan(items, "flask-topup-scan")
+    setStatus("Scanning current flask prices for Top Up...")
+end
+
+function JAP:BuildFlaskTopUpPostQueue()
+    clearArray(self.productionPostQueue)
+
+    local target = self:GetFlaskTopUpTarget()
+    local playerName = UnitName("player")
+    local queuedItems = 0
+    local key, flask
+
+    for key, flask in pairs(self.flaskTopUpBagFlasks or {}) do
+        local bagCount = getBagItemCountByName(flask.name)
+        local owner = self.flaskTopUpOwner[key]
+        local listings = self.flaskTopUpLiveListings[key] or {}
+        local competitorBest = nil
+        local i
+
+        for i = 1, table.getn(listings) do
+            local listing = listings[i]
+            local isMine =
+                listing.owner and playerName
+                and lower(listing.owner) == lower(playerName)
+
+            if not isMine and listing.unitPrice
+               and listing.unitPrice > 0 then
+                if competitorBest == nil
+                   or listing.unitPrice < competitorBest then
+                    competitorBest = listing.unitPrice
+                end
+            end
+        end
+
+        local ownLowest = owner and owner.lowest or nil
+        local postUnitPrice = nil
+
+        -- Preserve our own cheapest price if it is already at or below the
+        -- competitor. This prevents JAP from undercutting itself.
+        if ownLowest
+           and (competitorBest == nil
+                or ownLowest <= competitorBest) then
+            postUnitPrice =
+                math.max(1, math.floor(ownLowest + 0.5))
+        elseif competitorBest then
+            postUnitPrice =
+                math.max(1, math.floor(competitorBest) - 1)
+        end
+
+        if postUnitPrice then
+            local marketFloor =
+                competitorBest or postUnitPrice
+
+            local failsafeTriggered,
+                  failsafeReference,
+                  failsafeSamples =
+                self:IsFlaskPriceFailsafeTriggered(
+                    flask.name,
+                    marketFloor
+                )
+
+            if failsafeTriggered then
+                local difference =
+                    failsafeReference - marketFloor
+                local reducedMarketSellers =
+                    self:CountFlaskFailsafeMarketSellers(
+                        listings,
+                        failsafeReference,
+                        playerName
+                    )
+                local clusterListings, clusterSellers =
+                    self:CountFlaskFailsafeMarketCluster(
+                        listings,
+                        marketFloor,
+                        playerName
+                    )
+
+                local sellerConsensus =
+                    reducedMarketSellers >=
+                    FLASK_PRICE_FAILSAFE_MARKET_SELLERS
+                local listingConsensus =
+                    clusterListings >=
+                    FLASK_PRICE_FAILSAFE_CLUSTER_LISTINGS
+                    and clusterSellers >=
+                    FLASK_PRICE_FAILSAFE_CLUSTER_SELLERS
+
+                if sellerConsensus or listingConsensus then
+                    chat(
+                        "|cff55ff55FLASK FAILSAFE OVERRIDE: " ..
+                        flask.name ..
+                        " is " ..
+                        moneyToText(difference) ..
+                        " below historical reference, but the current " ..
+                        "market is established (" ..
+                        tostring(reducedMarketSellers) ..
+                        " reduced-price sellers; " ..
+                        tostring(clusterListings) ..
+                        " listings within 50s of floor from " ..
+                        tostring(clusterSellers) ..
+                        " seller(s)). Treating it as the current market.|r"
+                    )
+
+                    failsafeTriggered = false
+                else
+                    chat(
+                        "|cffff2020FLASK FAILSAFE: " ..
+                        flask.name ..
+                        " market floor " ..
+                        moneyToText(marketFloor) ..
+                        " is " ..
+                        moneyToText(difference) ..
+                        " below historical reference " ..
+                        moneyToText(failsafeReference) ..
+                        " (" .. tostring(failsafeSamples) ..
+                        " prior sample(s); " ..
+                        tostring(reducedMarketSellers) ..
+                        "/" ..
+                        tostring(FLASK_PRICE_FAILSAFE_MARKET_SELLERS) ..
+                        " reduced-price sellers; " ..
+                        tostring(clusterListings) ..
+                        "/" ..
+                        tostring(FLASK_PRICE_FAILSAFE_CLUSTER_LISTINGS) ..
+                        " near-floor listings from " ..
+                        tostring(clusterSellers) ..
+                        " seller(s)). Nothing will be posted.|r"
+                    )
+
+                    setStatus(
+                        "Flask price failsafe: skipped " ..
+                        flask.name ..
+                        " because current price is more than 1g below history."
+                    )
+
+                    if UIErrorsFrame and UIErrorsFrame.AddMessage then
+                        UIErrorsFrame:AddMessage(
+                            "FLASK PRICE FAILSAFE - NOT POSTING!",
+                            1,
+                            0.1,
+                            0.1,
+                            1.0
+                        )
+                    end
+
+                    self.flaskShortageAlarmRemaining = 3
+                    self.flaskShortageAlarmNextAt = now()
+                end
+            end
+
+            if not failsafeTriggered then
+                local alreadyAtLowest = 0
+
+            if owner and owner.stacks then
+                for i = 1, table.getn(owner.stacks) do
+                    local stack = owner.stacks[i]
+                    local stackUnit =
+                        math.floor((stack.unitPrice or 0) + 0.5)
+
+                    if stackUnit == postUnitPrice then
+                        alreadyAtLowest =
+                            alreadyAtLowest + (stack.count or 1)
+                    end
+                end
+            end
+
+            local missing =
+                math.max(0, target - alreadyAtLowest)
+            local toPost = math.min(missing, bagCount)
+
+            if missing > bagCount then
+                self:TriggerFlaskShortageAlarm(
+                    flask.name,
+                    missing,
+                    bagCount,
+                    target
+                )
+            end
+
+            if toPost > 0 then
+                -- Flask automation uses the exact same Bid and Buyout
+                -- price. The Buyout itself remains the existing competitive
+                -- price (normally 1 copper below the cheapest competitor).
+                local minBid = postUnitPrice
+
+                local postIndex
+                for postIndex = 1, toPost do
+                    table.insert(self.productionPostQueue, {
+                        name = flask.name,
+                        key = key,
+                        sourceUnitPrice =
+                            competitorBest or postUnitPrice,
+                        ownUnitBuyout = postUnitPrice,
+                        stackSize = 1,
+                        buyout = postUnitPrice,
+                        minBid = minBid,
+                        flaskTopUp = true
+                    })
+                    queuedItems = queuedItems + 1
+                end
+
+                chat(
+                    flask.name .. ": " ..
+                    alreadyAtLowest .. "/" .. target ..
+                    " already at lowest; posting " ..
+                    toPost .. " more at " ..
+                    moneyToText(postUnitPrice) .. " each."
+                )
+            else
+                chat(
+                    flask.name .. ": already has " ..
+                    alreadyAtLowest .. "/" .. target ..
+                    " at the lowest price."
+                )
+            end
+            end
+        else
+            chat(
+                flask.name ..
+                ": no current own/competitor price found; skipped."
+            )
+        end
+    end
+
+    return queuedItems
+end
+
+function JAP:ScheduleFreshMyAuctionsCheckAfterFlaskTopUp()
+    -- Give Turtle a short moment to commit the final posted auction to the
+    -- owner list, then use the exact same path as a manual Check My Auctions.
+    self.flaskTopUpRecheckAt = now() + 0.75
+
+    -- Visually clear immediately so stale pre-top-up prices/statuses do not
+    -- remain on screen while waiting for the fresh owner list.
+    self:ClearAuctionWatch()
+    self.scrollOffset = 0
+    self:RefreshUI()
+
+    setStatus(
+        "Flask Top Up complete. Rechecking My Auctions from scratch..."
+    )
+end
+
+function JAP:ProcessFlaskTopUpFreshRecheck()
+    local recheckAt = self.flaskTopUpRecheckAt or 0
+    if recheckAt <= 0 or now() < recheckAt then return end
+
+    self.flaskTopUpRecheckAt = 0
+
+    if not AuctionFrame or not AuctionFrame:IsVisible() then
+        setStatus(
+            "Flask Top Up complete; reopen the Auction House to recheck."
+        )
+        return
+    end
+
+    -- StartAuctionWatch clears the table again, reads the complete current
+    -- owner list, and runs a fresh competitor scan for every posted Alchemy
+    -- product. Nothing from the old market result is reused.
+    self:StartAuctionWatch()
+end
+
+function JAP:RefreshMyAuctionsOwnerOnlyAfterPost()
+    self.auctionWatchPreservedResults =
+        self.auctionWatchResults or {}
+    self.auctionWatchOwn = {}
+    self.auctionWatchResults = {}
+    self.auctionWatchSelected = nil
+    self.auctionWatchSelectedItems = {}
+    self.scrollOffset = 0
+    self.auctionWatchOwnerRefreshOnly = true
+    self.auctionWatchOwnerScanRunning = true
+    self.auctionWatchOwnerRefreshStage = 1
+    self.auctionWatchOwnerRefreshProcessAt = now() + 0.50
+
+    self:RequestOwnerAuctionList()
+end
+
 local function getBagSlotByName(itemName)
     if not itemName then return nil, nil, nil end
 
@@ -6511,6 +8089,16 @@ end
 
 function JAP:StopProductionPost(reason)
     self.productionPostRunning = false
+    self.flaskTopUpRunning = false
+    self.flaskTopUpScanPending = false
+    self.flaskTopUpRecheckAt = 0
+
+    if self.autoFlasksRunning then
+        self.autoFlasksRunning = false
+        self.autoFlasksPhase = nil
+        self.flaskTopUpFilterKeys = nil
+        chat("Auto Flasks stopped: " .. tostring(reason or "posting stopped"))
+    end
     self.productionPostNextAt = 0
     self.productionPostPending = nil
     self.productionPostPrepareAttempts = 0
@@ -6755,7 +8343,8 @@ function JAP:SendProductionPurchaseQuery()
     if now() < self.productionBuyNextAt then return end
 
     local elapsed = now() - (self.lastQueryAt or 0)
-    if elapsed < (self.queryDelay or 0.05) then return end
+    local adaptiveDelay = self:GetAdaptiveAuctionQueryDelay()
+    if elapsed < adaptiveDelay then return end
 
     local canSend = true
     if CanSendAuctionQuery then
@@ -6788,6 +8377,8 @@ function JAP:ProcessProductionPurchaseResults()
        or not self.productionBuyPendingQuery then
         return false
     end
+
+    self.lastAuctionResponseAt = now()
 
     local query = self.productionBuyPendingQuery
     local purchase = query.purchase
@@ -7823,6 +9414,37 @@ function JAP:OnProductionAuctionStarted()
 
     local post = self.productionPostPending
 
+    if self.flaskTopUpRunning and post.flaskTopUp then
+        self.flaskTopUpPosted =
+            (self.flaskTopUpPosted or 0) + (post.stackSize or 1)
+
+        table.remove(self.productionPostQueue, 1)
+
+        self.productionPostPending = nil
+        self.productionPostPrepareAttempts = 0
+        self.productionPostConfirmAttempts = 0
+        self.productionPostSplitSourceBag = nil
+        self.productionPostSplitSourceSlot = nil
+        self.productionPostSplitTargetBag = nil
+        self.productionPostSplitTargetSlot = nil
+        self.productionPostSourceBag = nil
+        self.productionPostSourceSlot = nil
+        self.productionPostStartedAt = 0
+        self.productionPostStage = nil
+
+        setStatus(
+            "Flask Top Up: server confirmed " ..
+            post.name .. " at " ..
+            moneyToText(post.buyout) ..
+            "; " .. table.getn(self.productionPostQueue) ..
+            " auction(s) remaining."
+        )
+
+        self.productionPostNextAt = now() + 0.25
+        self:RefreshUI()
+        return
+    end
+
     local postKey = post.key or normalizeKey(post.name)
     local progress = self.productionPostProgress[postKey]
 
@@ -7942,10 +9564,36 @@ function JAP:ProcessProductionPost()
         self.productionPostPending = nil
         self.productionPostStage = nil
         self.productionPostStartedAt = 0
-        setStatus("All planned potion auctions were posted.")
-        chat("Production posting complete.")
+
+        if self.flaskTopUpRunning then
+            self.flaskTopUpRunning = false
+
+            if self.autoFlasksRunning
+               and self.autoFlasksPhase == "topup" then
+                self.autoFlasksPosted =
+                    self.flaskTopUpPosted or 0
+                self.autoFlasksPhase = "final-check"
+            end
+
+            setStatus(
+                "Flask Top Up complete: " ..
+                tostring(self.flaskTopUpPosted or 0) ..
+                " flask(s) posted."
+            )
+            chat(
+                "Flask Top Up complete: " ..
+                tostring(self.flaskTopUpPosted or 0) ..
+                " flask(s) posted."
+            )
+
+            self:ScheduleFreshMyAuctionsCheckAfterFlaskTopUp()
+        else
+            setStatus("All planned potion auctions were posted.")
+            chat("Production posting complete.")
+            self:RefreshUI()
+        end
+
         self:PlayCompletionSound("post")
-        self:RefreshUI()
         return
     end
 
@@ -8334,6 +9982,151 @@ function JAP:CreateUI()
     )
     auctionWatchCancelUndercutButton:Hide()
 
+    local flaskTopUpLabel =
+        frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    flaskTopUpLabel:SetPoint(
+        "TOPLEFT",
+        frame,
+        "TOPLEFT",
+        20,
+        -137
+    )
+    flaskTopUpLabel:SetText("Flasks at lowest:")
+    table.insert(self.auctionWatchControls, flaskTopUpLabel)
+    flaskTopUpLabel:Hide()
+
+    local flaskTopUpTargetEdit =
+        CreateFrame(
+            "EditBox",
+            nil,
+            frame,
+            "InputBoxTemplate"
+        )
+    self.flaskTopUpTargetEdit = flaskTopUpTargetEdit
+    flaskTopUpTargetEdit:SetWidth(42)
+    flaskTopUpTargetEdit:SetHeight(20)
+    flaskTopUpTargetEdit:SetPoint(
+        "LEFT",
+        flaskTopUpLabel,
+        "RIGHT",
+        8,
+        0
+    )
+    flaskTopUpTargetEdit:SetAutoFocus(false)
+    flaskTopUpTargetEdit:SetNumeric(true)
+    flaskTopUpTargetEdit:SetMaxLetters(2)
+    flaskTopUpTargetEdit:SetText(
+        tostring(
+            tonumber(db().settings.flaskTopUpTarget) or 3
+        )
+    )
+    flaskTopUpTargetEdit:SetScript("OnEnterPressed", function()
+        JAP:GetFlaskTopUpTarget()
+        this:ClearFocus()
+    end)
+    flaskTopUpTargetEdit:SetScript("OnEditFocusLost", function()
+        JAP:GetFlaskTopUpTarget()
+    end)
+    table.insert(
+        self.auctionWatchControls,
+        flaskTopUpTargetEdit
+    )
+    flaskTopUpTargetEdit:Hide()
+
+    local flaskTopUpButton = self:CreateButton(
+        frame,
+        "Top Up Flasks",
+        115,
+        200,
+        -137,
+        function() JAP:StartFlaskTopUp() end
+    )
+    self.flaskTopUpButton = flaskTopUpButton
+    table.insert(self.auctionWatchControls, flaskTopUpButton)
+    flaskTopUpButton:Hide()
+
+    local autoFlasksButton = self:CreateButton(
+        frame,
+        "Auto Flasks",
+        105,
+        325,
+        -137,
+        function() JAP:StartAutoFlasks() end
+    )
+    self.autoFlasksButton = autoFlasksButton
+    table.insert(self.auctionWatchControls, autoFlasksButton)
+    autoFlasksButton:Hide()
+
+    local flaskFilterTitle =
+        frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    flaskFilterTitle:SetPoint(
+        "TOPLEFT",
+        frame,
+        "TOPLEFT",
+        20,
+        -166
+    )
+    flaskFilterTitle:SetText("")
+    table.insert(self.auctionWatchControls, flaskFilterTitle)
+    flaskFilterTitle:Hide()
+
+    self.flaskAutomationFilterSlots = {}
+
+    local filterIndex
+    for filterIndex = 1, 3 do
+        local filterCheck = CreateFrame(
+            "CheckButton",
+            "JAPFlaskAutomationFilter" .. tostring(filterIndex),
+            frame,
+            "UICheckButtonTemplate"
+        )
+        filterCheck:SetWidth(22)
+        filterCheck:SetHeight(22)
+
+        local checkboxX = 24 + ((filterIndex - 1) * 125)
+
+        filterCheck:SetPoint(
+            "TOPLEFT",
+            frame,
+            "TOPLEFT",
+            checkboxX,
+            -164
+        )
+        filterCheck:SetChecked(1)
+        filterCheck:SetScript("OnClick", function()
+            local flaskName = this.flaskName
+            if flaskName then
+                JAP:SetFlaskAutomationEnabled(
+                    flaskName,
+                    not JAP:IsFlaskAutomationEnabled(flaskName)
+                )
+            end
+        end)
+
+        local filterLabel =
+            frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        filterLabel:SetPoint(
+            "LEFT",
+            filterCheck,
+            "RIGHT",
+            1,
+            0
+        )
+        filterLabel:SetWidth(92)
+        filterLabel:SetJustifyH("LEFT")
+        filterLabel:SetText("")
+
+        table.insert(self.auctionWatchControls, filterCheck)
+        table.insert(self.auctionWatchControls, filterLabel)
+        filterCheck:Hide()
+        filterLabel:Hide()
+
+        table.insert(self.flaskAutomationFilterSlots, {
+            check = filterCheck,
+            label = filterLabel
+        })
+    end
+
     local auctionWatchHint =
         frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     auctionWatchHint:SetPoint(
@@ -8343,11 +10136,9 @@ function JAP:CreateUI()
         20,
         -111
     )
-    auctionWatchHint:SetWidth(500)
+    auctionWatchHint:SetWidth(395)
     auctionWatchHint:SetJustifyH("LEFT")
-    auctionWatchHint:SetText(
-        "Check live listings, cancel one selected product type, or cancel all undercut types."
-    )
+    auctionWatchHint:SetText("")
     table.insert(self.auctionWatchControls, auctionWatchHint)
     auctionWatchHint:Hide()
 
@@ -9095,9 +10886,10 @@ function JAP:CreateUI()
         -2,
         20
     )
-    detailScrollBar:SetMinMaxValues(0, 0)
-    detailScrollBar:SetValueStep(28)
-    detailScrollBar:SetValue(0)
+    -- Replace UIPanelScrollBarTemplate's default OnValueChanged handler
+    -- BEFORE SetValue() is called. Turtle/Vanilla's template handler expects
+    -- the slider parent itself to implement SetVerticalScroll(), which is not
+    -- true for this detail scrollbar and causes a load-time Lua error.
     detailScrollBar:SetScript("OnValueChanged", function()
         if JAP.updatingDetailScrollBar then return end
         if not JAP.detailScrollChild or not JAP.detailScrollFrame then return end
@@ -9105,6 +10897,10 @@ function JAP:CreateUI()
         JAP.detailScrollOffset = this:GetValue() or 0
         JAP:ApplyDetailScrollOffset()
     end)
+
+    detailScrollBar:SetMinMaxValues(0, 0)
+    detailScrollBar:SetValueStep(28)
+    detailScrollBar:SetValue(0)
     detailScrollBar:Hide()
 
     self:UpdateDetailScrollRange()
@@ -9369,6 +11165,16 @@ eventFrame:SetScript("OnEvent", function()
     elseif event == "NEW_AUCTION_UPDATE" then
         -- Production posting progression waits for ERR_AUCTION_STARTED instead.
     elseif event == "AUCTION_HOUSE_CLOSED" then
+        JAP.flaskTopUpPrepareAt = 0
+        JAP.flaskTopUpScanPending = false
+        JAP.flaskTopUpRunning = false
+        JAP.flaskTopUpRecheckAt = 0
+        JAP.autoFlasksRunning = false
+        JAP.autoFlasksPhase = nil
+        JAP.autoFlasksInitialOwner = {}
+        JAP.autoFlasksTargetKeys = {}
+        JAP.flaskTopUpFilterKeys = nil
+
         if JAP.scanRunning then
             JAP:CancelScan("Auction House was closed.")
         end
@@ -9411,6 +11217,9 @@ eventFrame:SetScript("OnUpdate", function()
     JAP:ProcessProductionActions()
     JAP:ProcessAuctionWatchCancelRefresh()
     JAP:ProcessAuctionWatchOwnerRefreshFallback()
+    JAP:ProcessFlaskTopUpPreparation()
+    JAP:ProcessFlaskTopUpFreshRecheck()
+    JAP:ProcessFlaskShortageAlarm()
 end)
 
 SLASH_JOCHENSALCHEMYPROFITS1 = "/jap"
